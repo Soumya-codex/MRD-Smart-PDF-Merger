@@ -33,7 +33,6 @@ except ImportError:
 DOC_LABELS = {
     "COVER", "SCAN", "SCANNED", "COPY", "FINAL", "PDF", "REPORT",
     "DOCUMENT", "DOC", "DISCHARGE", "SUMMARY", "TUMOUR", "TUMOR", "BOARD",
-    "S1", "S2", "S3", "S4", "S5", "S6", "S7", "S8", "S9"
 }
 GENERIC_PREFIXES = {"BABY", "OF"}
 DOCUMENT_PHRASES = (
@@ -48,8 +47,10 @@ def get_name_tokens(path_or_name):
     for phrase in DOCUMENT_PHRASES:
         stem = re.sub(rf"\b{phrase}\b", " ", stem)
 
-    # Numbered document labels and identifiers/dates are not patient names.
-    stem = re.sub(r"\b(?:S\d+|SCAN(?:NED)?\d+)\b", " ", stem)
+    # Remove scanner IDs before punctuation normalization so S-5 and S 5
+    # cannot leave a stray "S" token in the patient's name.
+    stem = re.sub(r"\b(?:S|SCAN(?:NED)?)\s*[-_]?\s*\d+\b", " ", stem)
+    # Dates, timestamps, and numeric identifiers are not patient-name tokens.
     stem = re.sub(r"\b[A-Z0-9]*\d[A-Z0-9]*\b", " ", stem)
     stem = re.sub(r"\b\d+\b", " ", stem)
     stem = re.sub(r"[^A-Z]+", " ", stem)
@@ -86,6 +87,7 @@ def make_groups(files):
                 "key": key,
                 "files": sorted(buckets[key], key=lambda path: (path.parent.as_posix().lower(), path.name.lower())),
                 "level": "Exact Match",
+                "category": "confirmed",
                 "confidence": 1.0,
             })
             matched_keys.add(key)
@@ -137,23 +139,10 @@ def make_groups(files):
             "key": first_key,
             "files": files_for_pair,
             "level": f"Possible Match ({score:.0%}) — Review Required",
+            "category": "review",
             "confidence": score,
         })
         matched_keys.update((first_key, second_key))
-
-    # Keep all remaining files visible as individual review cards; never match
-    # on the first name alone or assume that a singleton belongs to another group.
-    for key, items in buckets.items():
-        if key[0] == "__UNMATCHED__":
-            display_key = (items[0].stem.upper(),)
-            groups.append({"key": display_key, "files": items, "level": "Review Required", "confidence": 0.0})
-        elif key not in matched_keys:
-            groups.append({
-                "key": key,
-                "files": sorted(items, key=lambda path: (path.parent.as_posix().lower(), path.name.lower())),
-                "level": "Review Required",
-                "confidence": 0.0,
-            })
 
     groups.sort(key=lambda group: " ".join(group["key"]).lower())
     return groups
@@ -164,6 +153,44 @@ def validate_page_range(start, end, total):
     if start < 1 or end < start or end > total:
         return f"page range must be between 1 and {total}"
     return None
+
+
+def source_folder_for_selection(selection):
+    """Return a shared source folder, or None when a destination must be chosen."""
+    return source_folder_for_paths(path for path, _start, _end in selection)
+
+
+def source_folder_for_paths(paths):
+    """Return a shared folder for all group sources, or None for mixed folders."""
+    folders = {Path(path).resolve().parent for path in paths}
+    return next(iter(folders)) if len(folders) == 1 else None
+
+
+def selected_items(items):
+    """Filter (is_checked, item) pairs using the same rule as merge selection."""
+    return [item for checked, item in items if checked]
+
+
+def selection_page_count(selection):
+    return sum(end - start + 1 for _path, start, end in selection)
+
+
+def unmatched_source_paths(files, groups):
+    """Return loaded source paths not displayed in a confirmed or review group."""
+    matched = {
+        str(path.resolve()).casefold()
+        for group in groups
+        for path in group["files"]
+    }
+    return [
+        path for path in files
+        if str(path.resolve()).casefold() not in matched
+    ]
+
+
+def is_generated_output(path):
+    """Recognize filenames created by this application during any session."""
+    return bool(re.search(r"_MERGED(?:_\d+)?\.pdf$", Path(path).name, re.IGNORECASE))
 
 
 def cleanup_paths_from_successes(successes):
@@ -232,15 +259,9 @@ def merge_pdf_selection(selection, output_dir, group_name, progress_callback=Non
 
     validated = []
     validated_paths = []
-    output_path = output_dir.resolve()
     for path, start, end in selection:
         if not path.is_file():
             raise FileNotFoundError(f"Source PDF not found: {path}")
-        source_path = path.resolve()
-        if source_path.parent == output_path or output_path in source_path.parents:
-            raise ValueError(
-                f"Output folder must be separate from original PDFs: {output_path}"
-            )
         reader = PdfReader(str(path), strict=False)
         if reader.is_encrypted:
             raise ValueError(f"{path.name}: password-protected PDF")
@@ -262,9 +283,10 @@ def merge_pdf_selection(selection, output_dir, group_name, progress_callback=Non
                 progress_callback(completed_pages, total_selected_pages)
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    safe_name = re.sub(r'[<>:"/\\\\|?*]', "_", group_name).strip(" .")
+    safe_name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", group_name).strip(" .")
     if not safe_name or safe_name == "__UNMATCHED__":
         safe_name = "Manual_Group"
+    safe_name = safe_name[:120].rstrip(" .") or "Manual_Group"
 
     fd, temp_name = tempfile.mkstemp(prefix=".mrd-merge-", suffix=".tmp", dir=output_dir)
     os.close(fd)
@@ -281,15 +303,14 @@ def merge_pdf_selection(selection, output_dir, group_name, progress_callback=Non
             name_suffix = "" if suffix == 1 else f"_{suffix}"
             candidate = output_dir / f"{safe_name}_MERGED{name_suffix}.pdf"
             try:
-                # Exclusive creation prevents overwriting even if another run races us.
-                with candidate.open("xb"):
-                    pass
+                # Linking is atomic and fails rather than replacing an existing file.
+                os.link(temp_path, candidate)
                 reserved_output = candidate
                 break
             except FileExistsError:
                 suffix += 1
 
-        os.replace(temp_path, reserved_output)
+        temp_path.unlink()
         return reserved_output, validated_paths
     except Exception:
         if reserved_output is not None:
@@ -318,18 +339,26 @@ class MRDPDFMerger:
         self._tree_file_paths = {}
         self._tree_folder_paths = {}
         self.page_counts = {}
+        self.page_errors = {}
         self._auto_unassigned = set()
+        self._generated_outputs = set()
+        self._row_settings = {}
         self.groups = []
         self.group_widgets = []
         self.manual_groups = []
         self.manual_group_widgets = []
         self._merge_queue = queue.Queue()
+        self._page_task_queue = queue.Queue()
+        self._page_result_queue = queue.Queue()
+        self._page_tasks = 0
+        self._page_polling = False
         self._merge_running = False
         self.dnd_enabled = False
         self.output_dir = None
         # Candidates accumulate through the current source-processing session.
         self.cleanup_candidates = {}
         self._build_ui()
+        threading.Thread(target=self._page_count_worker, daemon=True).start()
         self._enable_drag_drop()
         self.rebuild_groups(recompute=False)
 
@@ -380,7 +409,7 @@ class MRDPDFMerger:
         self.total_pages_var = tk.StringVar(value="0 pages")
         ttk.Label(toolbar, textvariable=self.total_pages_var).pack(side="left", padx=6)
 
-        self.output_var = tk.StringVar(value="Merged_PDFs (inside selected folder)")
+        self.output_var = tk.StringVar(value="Same-folder outputs; choose destination for mixed folders")
         ttk.Button(toolbar, text="Output Folder", command=self.choose_output).pack(side="right")
 
         self.drop_area = tk.Label(
@@ -427,6 +456,9 @@ class MRDPDFMerger:
         all_box.pack(fill="both", expand=True, pady=(0, 7))
         self.all_count_var = tk.StringVar(value="0 files")
         ttk.Label(all_box, textvariable=self.all_count_var, foreground="#555").pack(anchor="w")
+        self.filename_search_var = tk.StringVar()
+        ttk.Entry(all_box, textvariable=self.filename_search_var).pack(fill="x", pady=(4, 0))
+        self.filename_search_var.trace_add("write", lambda *_args: self.refresh_all_files_list())
         all_list_wrap = ttk.Frame(all_box)
         all_list_wrap.pack(fill="both", expand=True, pady=(5, 0))
         all_list_wrap.rowconfigure(0, weight=1)
@@ -469,6 +501,54 @@ class MRDPDFMerger:
         ttk.Label(all_box, textvariable=self.selected_source_var, foreground="#17365d",
                   wraplength=500).pack(anchor="w", pady=(3, 0))
 
+        manual_box = ttk.LabelFrame(left_panel, text="Manual Groups", padding=7)
+        manual_box.pack(fill="both", expand=True, pady=(0, 7))
+        manual_header = ttk.Frame(manual_box)
+        manual_header.pack(fill="x")
+        ttk.Label(
+            manual_header, text="Assign unmatched PDFs from the explorer.",
+            foreground="#5c6b7a"
+        ).pack(side="left", fill="x", expand=True)
+        ttk.Button(
+            manual_header, text="Create Group", style="Primary.TButton",
+            command=self.create_manual_group
+        ).pack(side="right")
+        manual_list_wrap = ttk.Frame(manual_box)
+        manual_list_wrap.pack(fill="both", expand=True, pady=(5, 0))
+        manual_list_wrap.rowconfigure(0, weight=1)
+        manual_list_wrap.columnconfigure(0, weight=1)
+        self.manual_canvas = tk.Canvas(
+            manual_list_wrap, highlightthickness=0, height=180, background="#f3f6fa"
+        )
+        self.manual_canvas.grid(row=0, column=0, sticky="nsew")
+        manual_scroll = ttk.Scrollbar(
+            manual_list_wrap, orient="vertical", command=self.manual_canvas.yview
+        )
+        manual_scroll.grid(row=0, column=1, sticky="ns")
+        self.manual_canvas.configure(yscrollcommand=manual_scroll.set)
+        manual_hscroll = ttk.Scrollbar(
+            manual_list_wrap, orient="horizontal", command=self.manual_canvas.xview
+        )
+        manual_hscroll.grid(row=1, column=0, sticky="ew")
+        self.manual_canvas.configure(xscrollcommand=manual_hscroll.set)
+        self.manual_cards_frame = ttk.Frame(self.manual_canvas)
+        self.manual_canvas_window = self.manual_canvas.create_window(
+            (0, 0), window=self.manual_cards_frame, anchor="nw"
+        )
+        self.manual_cards_frame.bind(
+            "<Configure>",
+            lambda _event: self.manual_canvas.configure(
+                scrollregion=self.manual_canvas.bbox("all")
+            )
+        )
+        self.manual_canvas.bind(
+            "<Configure>",
+            lambda event: self.manual_canvas.itemconfigure(
+                self.manual_canvas_window,
+                width=max(event.width, self.manual_cards_frame.winfo_reqwidth())
+            )
+        )
+
         # Left lower section: cleanup candidates from successful merges only.
         cleanup_box = ttk.LabelFrame(left_panel, text="Original PDFs ready for cleanup", padding=7)
         cleanup_box.pack(fill="both", expand=True)
@@ -481,11 +561,8 @@ class MRDPDFMerger:
         cleanup_tools.pack(fill="x", pady=(5, 2))
         ttk.Button(cleanup_tools, text="Select all", command=lambda: self.set_cleanup_checks(True)).pack(side="left")
         ttk.Button(cleanup_tools, text="Select none", command=lambda: self.set_cleanup_checks(False)).pack(side="left", padx=5)
-        self.cleanup_clear_button = ttk.Button(
-            cleanup_tools, text="Clean all",
-            style="Danger.TButton", command=self.cleanup_all_originals
-        )
-        self.cleanup_clear_button.pack(side="left")
+        self.cleanup_selected_var = tk.StringVar(value="0 selected")
+        ttk.Label(cleanup_tools, textvariable=self.cleanup_selected_var).pack(side="right")
 
         cleanup_list_wrap = ttk.Frame(cleanup_box)
         cleanup_list_wrap.pack(fill="both", expand=True)
@@ -512,11 +589,31 @@ class MRDPDFMerger:
         self.cleanup_empty_label = ttk.Label(cleanup_box, textvariable=self.cleanup_empty_var, foreground="#666")
         self.cleanup_empty_label.pack(anchor="w", pady=(3, 5))
         self.cleanup_button = ttk.Button(
-            cleanup_box, text="Move selected to Recycle Bin",
+            cleanup_box, text="Move Selected to Recycle Bin",
+            style="Danger.TButton",
             command=self.cleanup_selected_originals
         )
         self.cleanup_button.pack(fill="x", pady=(0, 4))
         # Right side: scrollable patient cards (same matching and merge controls as before).
+        match_tools = ttk.Frame(right_panel)
+        match_tools.pack(fill="x", pady=(0, 5))
+        self.match_summary_var = tk.StringVar(value="0 source PDFs  |  0 confirmed groups  |  0 review groups  |  0 unmatched PDFs")
+        ttk.Label(
+            right_panel, textvariable=self.match_summary_var,
+            foreground="#5c6b7a", wraplength=720
+        ).pack(anchor="w", pady=(0, 5))
+        ttk.Label(match_tools, text="Patient search:").pack(side="left")
+        self.patient_search_var = tk.StringVar()
+        ttk.Entry(match_tools, textvariable=self.patient_search_var, width=28).pack(side="left", padx=(5, 10))
+        ttk.Label(match_tools, text="Show:").pack(side="left")
+        self.match_filter_var = tk.StringVar(value="All")
+        ttk.Combobox(
+            match_tools, textvariable=self.match_filter_var, state="readonly",
+            values=("All", "Confirmed Matches", "Review Required"),
+            width=18
+        ).pack(side="left", padx=5)
+        self.patient_search_var.trace_add("write", lambda *_args: self._apply_group_filters())
+        self.match_filter_var.trace_add("write", lambda *_args: self._apply_group_filters())
         cards_outer = ttk.Frame(right_panel)
         cards_outer.pack(fill="both", expand=True)
         cards_outer.rowconfigure(0, weight=1)
@@ -543,8 +640,6 @@ class MRDPDFMerger:
             self.all_files_list.dnd_bind("<<DragInitCmd>>", self._begin_source_drag)
             self.drop_area.drop_target_register(DND_FILES)
             self.drop_area.dnd_bind("<<Drop>>", self._on_drop)
-            self.canvas.drop_target_register(DND_FILES)
-            self.canvas.dnd_bind("<<Drop>>", self._on_drop)
             self.dnd_enabled = True
         except Exception as exc:
             self.dnd_enabled = False
@@ -611,14 +706,9 @@ class MRDPDFMerger:
     def _add_paths(self, paths):
         found = []
         scan_errors = []
-        output_path = self.output_dir.resolve() if self.output_dir else None
         for path in paths:
             if path.is_dir():
-                try:
-                    is_output_root = output_path is not None and path.resolve() == output_path
-                except OSError:
-                    is_output_root = False
-                if path.name.lower() == "merged_pdfs" or is_output_root:
+                if path.name.lower() == "merged_pdfs":
                     continue
                 self._register_source_root(path)
                 for current, directories, filenames in os.walk(
@@ -629,11 +719,7 @@ class MRDPDFMerger:
                     kept_directories = []
                     for directory in directories:
                         candidate = current_path / directory
-                        try:
-                            is_output = output_path is not None and candidate.resolve() == output_path
-                        except OSError:
-                            is_output = False
-                        if directory.lower() != "merged_pdfs" and not is_output:
+                        if directory.lower() != "merged_pdfs":
                             kept_directories.append(directory)
                             self.source_directories.add(candidate.resolve())
                     directories[:] = kept_directories
@@ -656,18 +742,18 @@ class MRDPDFMerger:
                 resolved = p
             if any(parent.name.lower() == "merged_pdfs" for parent in resolved.parents):
                 continue
-            if output_path is not None and (resolved == output_path or output_path in resolved.parents):
-                continue
             if resolved not in existing:
+                if is_generated_output(resolved) or self._path_key(resolved) in self._generated_outputs:
+                    continue
                 self.files.append(p)
                 existing.add(resolved)
                 added += 1
 
         self.files.sort(key=lambda p: (p.parent.as_posix().lower(), p.name.lower()))
         if self.files and self.output_dir is None:
-            # Default output is a Merged_PDFs folder next to the first imported source.
+            # Retain a convenient starting folder for cross-folder destination dialogs.
             self.output_dir = self.files[0].parent / "Merged_PDFs"
-            self.output_var.set(str(self.output_dir))
+            self.output_var.set(f"Mixed-folder browse start: {self.output_dir}")
         self.rebuild_groups()
         self.file_count_label.config(text=f"{len(self.files)} PDFs loaded ({added} newly added)")
         self._update_total_page_count()
@@ -684,37 +770,32 @@ class MRDPDFMerger:
             return
         chosen = filedialog.askdirectory(title="Choose output folder")
         if chosen:
-            output_path = Path(chosen).resolve()
-            overlapping_sources = [
-                source for source in self.files
-                if source.resolve() == output_path
-                or source.parent.resolve() == output_path
-                or output_path in source.resolve().parents
-            ]
-            if overlapping_sources:
-                messagebox.showerror(
-                    "Choose a separate output folder",
-                    "The output folder must not contain original PDFs. Choose a separate folder "
-                    "(for example, a Merged_PDFs subfolder)."
-                )
-                return
-            self.output_dir = output_path
-            self.output_var.set(str(self.output_dir))
+            self.output_dir = Path(chosen).resolve()
+            self.output_var.set(f"Mixed-folder browse start: {self.output_dir}")
 
     def clear_all(self):
         if self._merge_running:
             messagebox.showwarning("Merge in progress", "Wait for the current merge operation to finish.")
             return
+        if not messagebox.askyesno(
+            "Clear current collection",
+            "Clear the loaded PDFs, groups and cleanup history for this session?\n\n"
+            "Original PDFs and merged output files will not be deleted."
+        ):
+            return
         self.files.clear()
         self.source_roots.clear()
         self.source_directories.clear()
         self.page_counts.clear()
+        self.page_errors.clear()
         self._auto_unassigned.clear()
         self.groups.clear()
         self.manual_groups.clear()
         self.cleanup_candidates.clear()
+        self._generated_outputs.clear()
+        self._row_settings.clear()
         self.output_dir = None
-        self.output_var.set("Merged_PDFs (inside selected folder)")
+        self.output_var.set("Same-folder outputs; choose destination for mixed folders")
         self.file_count_label.config(text="0 PDFs loaded")
         self.total_pages_var.set("0 pages")
         self.rebuild_groups()
@@ -734,6 +815,8 @@ class MRDPDFMerger:
             target = self.all_files_list
         elif self._point_inside(self.cleanup_canvas, pointer_x, pointer_y):
             target = self.cleanup_canvas
+        elif self._point_inside(self.manual_canvas, pointer_x, pointer_y):
+            target = self.manual_canvas
         elif self._point_inside(self.canvas, pointer_x, pointer_y):
             target = self.canvas
         else:
@@ -786,10 +869,23 @@ class MRDPDFMerger:
                 if path.resolve().parent == folder or folder in path.resolve().parents
             )
 
+        query = self.filename_search_var.get().strip().casefold()
+        visible_files = [
+            path for path in self.files
+            if not query or query in path.name.casefold()
+        ]
         all_directories = set(self.source_directories)
         all_directories.update(path.parent.resolve() for path in self.files)
         for root in roots:
             all_directories.add(root)
+        if query:
+            all_directories = set(roots)
+            for path in visible_files:
+                current = path.parent.resolve()
+                all_directories.add(current)
+                for parent in current.parents:
+                    if any(parent == root or root in parent.parents for root in roots):
+                        all_directories.add(parent)
         for folder in sorted(all_directories, key=lambda path: (len(path.parts), str(path).casefold())):
             containing_roots = [
                 root for root in roots if folder == root or root in folder.parents
@@ -814,7 +910,7 @@ class MRDPDFMerger:
             folder_ids[folder] = iid
             self._tree_folder_paths[iid] = folder
 
-        for index, path in enumerate(self.files):
+        for index, path in enumerate(visible_files):
             parent = path.parent.resolve()
             parent_iid = folder_ids.get(parent, "")
             iid = f"file:{index}"
@@ -830,7 +926,10 @@ class MRDPDFMerger:
             )
             if selected_iid:
                 self.all_files_list.selection_set(selected_iid)
-        self.all_count_var.set(f"{len(self.files)} file(s) found")
+        self.all_count_var.set(
+            f"{len(self.files)} PDF(s) found"
+            + (f"; {len(visible_files)} shown" if query else "")
+        )
         if not self.all_files_list.selection():
             self.selected_source_var.set("No source PDF selected.")
 
@@ -1011,6 +1110,7 @@ class MRDPDFMerger:
         for path in sorted(candidates, key=lambda p: (p.parent.as_posix().lower(), p.name.lower())):
             var = tk.BooleanVar(value=True)
             self.cleanup_vars[str(path)] = var
+            var.trace_add("write", lambda *_args: self.update_cleanup_selection_count())
             row = ttk.Frame(self.cleanup_rows_frame)
             row.pack(fill="x", anchor="w")
             ttk.Checkbutton(row, variable=var).pack(side="left")
@@ -1022,13 +1122,16 @@ class MRDPDFMerger:
             self.cleanup_button.config(
                 state=("normal" if candidates else "disabled")
             )
-            self.cleanup_clear_button.config(
-                state=("normal" if candidates else "disabled")
-            )
+        self.update_cleanup_selection_count()
 
     def set_cleanup_checks(self, checked):
         for var in getattr(self, "cleanup_vars", {}).values():
             var.set(checked)
+
+    def update_cleanup_selection_count(self):
+        selected = sum(var.get() for var in getattr(self, "cleanup_vars", {}).values())
+        if hasattr(self, "cleanup_selected_var"):
+            self.cleanup_selected_var.set(f"{selected} selected")
 
     def cleanup_selected_originals(self):
         selected = [
@@ -1045,101 +1148,55 @@ class MRDPDFMerger:
             )
             return
 
-        existing = [p for p in selected if p.exists() and p.is_file()]
-        if not existing:
-            messagebox.showinfo("No files found", "The selected source PDFs no longer exist.")
-            return
-        names = "\n".join(f"{p.name}\n  {p}" for p in existing[:12])
-        if len(existing) > 12:
-            names += f"\n... and {len(existing) - 12} more"
+        names = "\n".join(f"{p.name}\n  {p}" for p in selected[:12])
+        if len(selected) > 12:
+            names += f"\n... and {len(selected) - 12} more"
         if not messagebox.askyesno(
             "Confirm cleanup",
-            f"Move {len(existing)} original PDF(s) to the Windows Recycle Bin?\n\n"
+            f"Move {len(selected)} selected original PDF(s) to the Windows Recycle Bin?\n\n"
             f"{names}\n\nMerged output PDFs will remain untouched."
         ):
             return
 
-        moved, failed = [], []
-        for path in existing:
-            try:
-                send2trash(str(path))
-                moved.append(path)
-                self.cleanup_candidates.pop(str(path), None)
-                # Remove deleted originals from the source list and patient cards.
-                self.files = [p for p in self.files if not self._same_path(p, path)]
-                self.page_counts.pop(self._path_key(path), None)
-                self._auto_unassigned.discard(self._path_key(path))
-                for group in self.manual_groups:
-                    group["files"] = [
-                        source for source in group["files"] if not self._same_path(source, path)
-                    ]
-            except Exception as exc:
-                failed.append(f"{path.name}: {exc}")
+        moved, failed = move_cleanup_sources_to_trash(selected, send2trash)
+        self._remove_recycled_sources(moved)
 
         self.rebuild_groups()
         self.file_count_label.config(text=f"{len(self.files)} PDFs loaded")
         self._update_total_page_count()
         message = f"Moved {len(moved)} original PDF(s) to the Recycle Bin."
         if failed:
-            message += "\n\nCould not move:\n" + "\n".join(failed[:10])
-        self.status_var.set(message)
-        messagebox.showinfo("Cleanup finished", message)
-
-    def cleanup_all_originals(self):
-        """Confirm and send every listed cleanup source to the Recycle Bin."""
-        candidates = list(self.cleanup_candidates.values())
-        if not candidates:
-            messagebox.showinfo("Cleanup is empty", "There are no original PDFs listed for cleanup.")
-            return
-        if send2trash is None:
-            messagebox.showerror(
-                "Recycle Bin support missing",
-                "Install the required packages with:\npy -m pip install -r requirements.txt"
+            message += "\n\nCould not move:\n" + "\n".join(
+                f"{path.name} ({path}): {error}" for path, error in failed[:10]
             )
-            return
+        self.status_var.set(message)
+        if failed:
+            messagebox.showwarning("Cleanup completed with errors", message)
+        else:
+            messagebox.showinfo("Cleanup finished", message)
 
-        source_list = "\n".join(f"{path.name}\n  {path}" for path in candidates[:12])
-        if len(candidates) > 12:
-            source_list += f"\n... and {len(candidates) - 12} more"
-        if not messagebox.askyesno(
-            "Confirm cleanup of all listed originals",
-            f"Move all {len(candidates)} original PDF(s) in the Cleanup list "
-            "to the Windows Recycle Bin?\n\n"
-            f"{source_list}\n\nGenerated merged output PDFs and files not listed "
-            "for cleanup will not be moved."
-        ):
-            return
-
-        moved, failures = move_cleanup_sources_to_trash(candidates, send2trash)
+    def _remove_recycled_sources(self, moved):
         for path in moved:
             self.cleanup_candidates.pop(str(path), None)
             self.files = [source for source in self.files if not self._same_path(source, path)]
             self.page_counts.pop(self._path_key(path), None)
+            self.page_errors.pop(self._path_key(path), None)
             self._auto_unassigned.discard(self._path_key(path))
             for group in self.manual_groups:
                 group["files"] = [
                     source for source in group["files"] if not self._same_path(source, path)
                 ]
 
-        self.rebuild_groups()
-        self.file_count_label.config(text=f"{len(self.files)} PDFs loaded")
-        self._update_total_page_count()
-        summary = f"Moved {len(moved)} of {len(candidates)} listed original PDF(s) to the Recycle Bin."
-        if failures:
-            summary += "\n\nNot moved (still listed for cleanup):\n" + "\n".join(
-                f"{path.name} ({path}): {error}" for path, error in failures[:10]
-            )
-            if len(failures) > 10:
-                summary += f"\n... and {len(failures) - 10} more failure(s)"
-        self.status_var.set(summary)
-        if failures:
-            messagebox.showwarning("Cleanup completed with errors", summary)
-        else:
-            messagebox.showinfo("Cleanup finished", summary)
-
     def rebuild_groups(self, recompute=True):
         self.refresh_all_files_list()
         self.refresh_cleanup_panel()
+        for group_ui in self.group_widgets + self.manual_group_widgets:
+            for row in group_ui["rows"]:
+                self._row_settings[self._path_key(row["path"])] = {
+                    "use": row["use"].get(),
+                    "from": row["from"].get(),
+                    "to": row["to"].get(),
+                }
         if recompute:
             manual_paths = {
                 self._path_key(path) for group in self.manual_groups for path in group["files"]
@@ -1151,45 +1208,108 @@ class MRDPDFMerger:
             ])
         for child in self.cards_frame.winfo_children():
             child.destroy()
+        for child in self.manual_cards_frame.winfo_children():
+            child.destroy()
         self.group_widgets.clear()
         self.manual_group_widgets.clear()
+        self.cards_frame.columnconfigure(0, weight=1)
+        self.manual_cards_frame.columnconfigure(0, weight=1)
 
-        automatic_header = ttk.Frame(self.cards_frame, padding=(4, 8))
-        automatic_header.pack(fill="x")
-        ttk.Label(automatic_header, text="Automatic patient matching",
-                  font=("Segoe UI", 13, "bold")).pack(anchor="w")
-        ttk.Label(automatic_header, text="Suggested from filenames; review matches before merging.",
-                  foreground="#5c6b7a").pack(anchor="w", pady=(2, 0))
-        if not self.groups:
-            ttk.Label(self.cards_frame, text="No automatic matches yet. Unmatched PDFs remain in the source list.",
-                      foreground="#5c6b7a").pack(anchor="w", padx=8, pady=8)
+        self.category_sections = {}
+        self._section_empty_labels = {}
+        category_titles = (
+            ("confirmed", "CONFIRMED MATCHES"),
+            ("review", "REVIEW REQUIRED"),
+        )
+        for section_index, (category, title) in enumerate(category_titles):
+            section = ttk.Frame(self.cards_frame)
+            section.grid(row=section_index, column=0, sticky="ew")
+            section.columnconfigure(0, weight=1)
+            ttk.Label(section, text=title, font=("Segoe UI", 13, "bold")).pack(
+                anchor="w", padx=4, pady=(10, 4)
+            )
+            empty_text = (
+                "No confirmed patient groups." if category == "confirmed"
+                else "No spelling-variation suggestions require review."
+            )
+            empty_label = ttk.Label(
+                section, text=empty_text, foreground="#667789", padding=(8, 3)
+            )
+            empty_label.pack(anchor="w")
+            self._section_empty_labels[category] = empty_label
+            self.category_sections[category] = section
 
         for number, group in enumerate(self.groups, start=1):
             self._create_group_card(number, group)
 
-        manual_header = ttk.Frame(self.cards_frame, padding=(4, 12, 4, 5))
-        manual_header.pack(fill="x")
-        ttk.Label(manual_header, text="Any Other Files to Merge",
-                  font=("Segoe UI", 13, "bold")).pack(side="left")
-        ttk.Button(manual_header, text="Create Manual Merge Group",
-                   style="Primary.TButton", command=self.create_manual_group).pack(side="right")
-        ttk.Label(
-            self.cards_frame,
-            text="Group unrelated filenames for one patient. Select a source PDF on the left, or browse to add one.",
-            foreground="#5c6b7a", wraplength=800
-        ).pack(anchor="w", padx=8, pady=(0, 5))
-        if not self.manual_groups:
-            ttk.Label(
-                self.cards_frame,
-                text="No manual groups yet. Create a group when filename matching is not appropriate.",
-                foreground="#667789", padding=8
-            ).pack(anchor="w")
         for manual_group in self.manual_groups:
             self._create_manual_group_card(manual_group)
+        if not self.manual_groups:
+            ttk.Label(
+                self.manual_cards_frame,
+                text="No manual groups yet. Select an explorer PDF and create a group.",
+                foreground="#667789", padding=8
+            ).grid(row=0, column=0, sticky="w")
+        self.manual_canvas.configure(scrollregion=self.manual_canvas.bbox("all"))
+        confirmed_count = sum(group["category"] == "confirmed" for group in self.groups)
+        review_count = sum(group["category"] == "review" for group in self.groups)
+        matched_paths = {
+            self._path_key(path)
+            for group in self.groups
+            for path in group["files"]
+        }
+        unassigned_count = len(unmatched_source_paths(self.files, self.groups))
+        self.match_summary_var.set(
+            f"{len(self.files)} source PDFs  |  {confirmed_count} confirmed groups  |  "
+            f"{review_count} review-required groups  |  {unassigned_count} unmatched PDFs"
+        )
+        self._apply_group_filters()
+
+    def _apply_group_filters(self):
+        if not hasattr(self, "category_sections"):
+            return
+        query = self.patient_search_var.get().strip().casefold()
+        selected_filter = self.match_filter_var.get()
+        categories = {
+            "Confirmed Matches": "confirmed",
+            "Review Required": "review",
+        }
+        visible_by_category = {category: 0 for category in self.category_sections}
+        for group_ui in self.group_widgets:
+            group_ui["card"].pack_forget()
+        for group_ui in self.group_widgets:
+            category = group_ui["group"]["category"]
+            label = " ".join(group_ui["group"]["key"]).casefold()
+            visible = (
+                (not query or query in label)
+                and (selected_filter == "All" or categories.get(selected_filter) == category)
+            )
+            if visible:
+                group_ui["card"].pack(fill="x", padx=5, pady=5)
+                visible_by_category[category] += 1
+            else:
+                group_ui["card"].pack_forget()
+        for category, section in self.category_sections.items():
+            category_filter = categories.get(selected_filter)
+            if selected_filter == "All" or category_filter == category:
+                section.grid()
+                if visible_by_category[category]:
+                    self._section_empty_labels[category].pack_forget()
+                else:
+                    self._section_empty_labels[category].pack(anchor="w")
+                    default_text = (
+                        "No confirmed patient groups." if category == "confirmed"
+                        else "No spelling-variation suggestions require review."
+                    )
+                    self._section_empty_labels[category].configure(
+                        text=f"No results for “{query}”." if query else default_text
+                    )
+            else:
+                section.grid_remove()
 
     def _create_group_card(self, number, group):
         card = ttk.LabelFrame(
-            self.cards_frame,
+            self.category_sections[group["category"]],
             text=f"  {number}. {' '.join(group['key'])}  —  {group['level']}  ",
             padding=7
         )
@@ -1197,16 +1317,17 @@ class MRDPDFMerger:
 
         header = ttk.Frame(card)
         header.pack(fill="x", pady=(0, 4))
-        count_var = tk.StringVar(value=f"{len(group['files'])} PDF(s) in this group")
+        count_var = tk.StringVar()
+        details_button = ttk.Button(header, text="Collapse", style="Small.TButton")
+        details_button.pack(side="left", padx=(0, 5))
         ttk.Label(header, textvariable=count_var, font=("Segoe UI", 9, "bold")).pack(side="left")
-        status_var = tk.StringVar(
-            value="Ready to Merge" if group["level"] == "Exact Match" else "Review Required"
+        group_status_var = tk.StringVar(
+            value="Confirmed" if group["category"] == "confirmed" else "Review Required"
         )
-        ttk.Label(header, textvariable=status_var, foreground="#356b50").pack(side="left", padx=(8, 0))
-        ttk.Button(header, text="Select All", style="Small.TButton",
-                   command=lambda gidx=number-1: self.set_group_checks(gidx, True)).pack(side="right", padx=2)
-        ttk.Button(header, text="Uncheck All", style="Small.TButton",
-                   command=lambda gidx=number-1: self.set_group_checks(gidx, False)).pack(side="right", padx=2)
+        ttk.Label(
+            header, textvariable=group_status_var,
+            foreground="#356b50" if group["category"] == "confirmed" else "#8a5a00"
+        ).pack(side="left", padx=(8, 0))
         ttk.Button(header, text="Add from Left", style="Small.TButton",
                    command=lambda gidx=number-1: self.add_selected_left_file(gidx)).pack(side="right", padx=2)
         ttk.Button(header, text="Merge This Group", style="SmallPrimary.TButton",
@@ -1228,9 +1349,12 @@ class MRDPDFMerger:
 
         rows = []
         for row_index, path in enumerate(group["files"], start=1):
-            use_var = tk.BooleanVar(value=group["level"] == "Exact Match")
-            from_var = tk.StringVar(value="1")
-            to_var = tk.StringVar(value="…")
+            setting = self._row_settings.get(self._path_key(path), {})
+            use_var = tk.BooleanVar(
+                value=setting.get("use", group["category"] == "confirmed")
+            )
+            from_var = tk.StringVar(value=setting.get("from", "1"))
+            to_var = tk.StringVar(value=setting.get("to", "…"))
             page_var = tk.StringVar(value="Reading…")
             status_var = tk.StringVar(value="Loading")
             row_frame = ttk.Frame(table)
@@ -1268,38 +1392,41 @@ class MRDPDFMerger:
 
             self._read_page_count(row_data)
 
-        self.group_widgets.append({"group": group, "rows": rows, "card": card,
-                                   "count": count_var, "status": status_var})
+        group_ui = {
+            "group": group, "rows": rows, "card": card,
+            "count": count_var, "status": group_status_var, "details": table,
+        }
+        details_button.config(command=lambda target=group_ui, button=details_button:
+                              self.toggle_group_details(target, button))
+        self.group_widgets.append(group_ui)
         for row in rows:
             row["use"].trace_add(
-                "write", lambda *_args, target=self.group_widgets[-1]: self._update_group_summary(target)
+                "write", lambda *_args, target=group_ui: self._update_group_summary(target)
             )
             row["from"].trace_add(
-                "write", lambda *_args, target=self.group_widgets[-1]: self._update_group_summary(target)
+                "write", lambda *_args, target=group_ui: self._update_group_summary(target)
             )
             row["to"].trace_add(
-                "write", lambda *_args, target=self.group_widgets[-1]: self._update_group_summary(target)
+                "write", lambda *_args, target=group_ui: self._update_group_summary(target)
             )
-        self._update_group_summary(self.group_widgets[-1])
+        self._update_group_summary(group_ui)
 
     def _create_manual_group_card(self, group):
-        card = ttk.LabelFrame(self.cards_frame, text="  Manual Group  ", padding=10)
+        card = ttk.LabelFrame(self.manual_cards_frame, text="  Manual Group  ", padding=8)
         card.pack(fill="x", padx=5, pady=6)
         header = ttk.Frame(card)
         header.pack(fill="x")
+        details_button = ttk.Button(header, text="Collapse", style="Small.TButton")
+        details_button.pack(side="left", padx=(0, 5))
         ttk.Label(header, text="Patient / group name:").pack(side="left")
         name_entry = ttk.Entry(header, textvariable=group["name_var"], width=28)
         name_entry.pack(side="left", padx=(5, 10), fill="x", expand=True)
         summary = tk.StringVar()
         ttk.Label(header, textvariable=summary, foreground="#356b50").pack(side="left")
-        status_var = tk.StringVar(value="Ready to Merge" if group["files"] else "Needs Review")
-        ttk.Label(header, textvariable=status_var, foreground="#356b50").pack(side="right", padx=5)
+        group_status_var = tk.StringVar(value="Ready to Merge" if group["files"] else "Needs Review")
+        ttk.Label(header, textvariable=group_status_var, foreground="#356b50").pack(side="right", padx=5)
         actions = ttk.Frame(card)
         actions.pack(fill="x", pady=(6, 7))
-        ttk.Button(actions, text="Select all", style="Small.TButton",
-                   command=lambda target=group: self.set_manual_checks(target, True)).pack(side="left")
-        ttk.Button(actions, text="Select none", style="Small.TButton",
-                   command=lambda target=group: self.set_manual_checks(target, False)).pack(side="left", padx=4)
         ttk.Button(actions, text="Delete Group", style="Small.TButton",
                    command=lambda target=group: self.delete_manual_group(target)).pack(side="right")
         ttk.Button(actions, text="Merge This Group", style="SmallPrimary.TButton",
@@ -1321,9 +1448,10 @@ class MRDPDFMerger:
 
         rows = []
         for row_index, path in enumerate(group["files"], start=1):
-            use_var = tk.BooleanVar(value=True)
-            from_var = tk.StringVar(value="1")
-            to_var = tk.StringVar(value="…")
+            setting = self._row_settings.get(self._path_key(path), {})
+            use_var = tk.BooleanVar(value=setting.get("use", True))
+            from_var = tk.StringVar(value=setting.get("from", "1"))
+            to_var = tk.StringVar(value=setting.get("to", "…"))
             page_var = tk.StringVar(value="Reading…")
             status_var = tk.StringVar(value="Loading")
             row_frame = ttk.Frame(table)
@@ -1358,12 +1486,15 @@ class MRDPDFMerger:
             self._read_page_count(row)
 
         widget = {"group": group, "rows": rows, "card": card,
-                  "summary": summary, "status": status_var}
+                  "summary": summary, "status": group_status_var, "details": table}
+        details_button.config(command=lambda target=widget, button=details_button:
+                              self.toggle_group_details(target, button))
         self.manual_group_widgets.append(widget)
         for row in rows:
             row["use"].trace_add("write", lambda *_args, target=widget: self._update_group_summary(target))
             row["from"].trace_add("write", lambda *_args, target=widget: self._update_group_summary(target))
             row["to"].trace_add("write", lambda *_args, target=widget: self._update_group_summary(target))
+        group["name_var"].trace_add("write", lambda *_args: self._apply_group_filters())
         self._update_group_summary(widget)
 
         if self.dnd_enabled:
@@ -1374,27 +1505,42 @@ class MRDPDFMerger:
             )
 
     def _update_group_summary(self, group_ui):
-        if "count" in group_ui:
-            prefix = f"{len(group_ui['group']['files'])} PDF(s)"
-        else:
-            prefix = f"{len(group_ui['group']['files'])} PDF(s)"
         selected_pages = 0
+        selected_pdfs = 0
+        total_pages = 0
         for row in group_ui["rows"]:
-            if not row["use"].get():
-                continue
             try:
                 total = int(row["pages"].get())
+                total_pages += total
+            except (TypeError, ValueError):
+                total = 0
+            if not row["use"].get():
+                continue
+            selected_pdfs += 1
+            try:
                 start = int(row["from"].get().strip())
                 end = int(row["to"].get().strip())
             except (TypeError, ValueError):
                 continue
             if validate_page_range(start, end, total) is None:
                 selected_pages += end - start + 1
-        summary_text = f"{prefix}  |  {selected_pages} selected pages"
+        summary_text = (
+            f"{len(group_ui['group']['files'])} PDFs ({selected_pdfs} selected)  |  "
+            f"{total_pages} pages ({selected_pages} selected)"
+        )
         if "count" in group_ui:
             group_ui["count"].set(summary_text)
         else:
             group_ui["summary"].set(summary_text)
+
+    @staticmethod
+    def toggle_group_details(group_ui, button):
+        if group_ui["details"].winfo_manager():
+            group_ui["details"].pack_forget()
+            button.config(text="Expand")
+        else:
+            group_ui["details"].pack(fill="x")
+            button.config(text="Collapse")
 
     def _read_page_count(self, row):
         if PdfReader is None:
@@ -1405,28 +1551,63 @@ class MRDPDFMerger:
         if path_key in self.page_counts:
             count = self.page_counts[path_key]
             row["pages"].set(str(count) if count else "N/A")
-            row["to"].set(str(count) if count else "")
+            if count and row["to"].get().strip() == "…":
+                row["to"].set(str(count))
             row["status"].set("Ready" if count else "Needs Review")
             return
-        try:
-            reader = PdfReader(str(row["path"]), strict=False)
-            if reader.is_encrypted:
-                self.page_counts[path_key] = None
-                row["pages"].set("N/A")
-                row["status"].set("Needs Review")
-                row["to"].set("")
+        row["pages"].set("Reading…")
+        row["status"].set("Checking")
+        self._page_tasks += 1
+        self._page_task_queue.put((path_key, row["path"]))
+        if not self._page_polling:
+            self._page_polling = True
+            self.root.after(100, self._poll_page_count_results)
+
+    def _page_count_worker(self):
+        while True:
+            path_key, path = self._page_task_queue.get()
+            count, error = None, None
+            try:
+                reader = PdfReader(str(path), strict=False)
+                if reader.is_encrypted:
+                    error = "password-protected PDF"
+                else:
+                    count = len(reader.pages)
+                    if not count:
+                        error = "PDF contains no pages"
+            except Exception as exc:
+                error = str(exc)
+            self._page_result_queue.put((path_key, count, error))
+
+    def _poll_page_count_results(self):
+        while True:
+            try:
+                path_key, count, _error = self._page_result_queue.get_nowait()
+            except queue.Empty:
+                break
+            self.page_counts[path_key] = count
+            if count:
+                self.page_errors.pop(path_key, None)
             else:
-                count = len(reader.pages)
-                self.page_counts[path_key] = count
-                row["pages"].set(str(count))
-                row["to"].set(str(count))
-                row["status"].set("Ready")
-        except Exception:
-            self.page_counts[path_key] = None
-            row["pages"].set("N/A")
-            row["status"].set("Needs Review")
-            row["to"].set("")
+                self.page_errors[path_key] = _error or "PDF is unreadable"
+            for group_ui in self.group_widgets + self.manual_group_widgets:
+                for row in group_ui["rows"]:
+                    if self._path_key(row["path"]) != path_key:
+                        continue
+                    row["pages"].set(str(count) if count else "N/A")
+                    if count:
+                        if row["to"].get().strip() == "…":
+                            row["to"].set(str(count))
+                        row["status"].set("Ready")
+                    else:
+                        row["status"].set("Needs Review")
+                    self._update_group_summary(group_ui)
+            self._page_tasks -= 1
         self._update_total_page_count()
+        if self._page_tasks:
+            self.root.after(100, self._poll_page_count_results)
+        else:
+            self._page_polling = False
 
     def move_row(self, rows, row, direction):
         try:
@@ -1463,17 +1644,18 @@ class MRDPDFMerger:
         errors = []
         if PdfReader is None:
             return selected, ["pypdf is not installed"]
-        for row in group_ui["rows"]:
-            if not row["use"].get():
-                continue
+        rows = selected_items((row["use"].get(), row) for row in group_ui["rows"])
+        for row in rows:
             path = row["path"]
             try:
                 if not path.is_file():
                     raise FileNotFoundError("source file is missing")
-                reader = PdfReader(str(path), strict=False)
-                if reader.is_encrypted:
-                    raise ValueError("password-protected PDF")
-                total = len(reader.pages)
+                path_key = self._path_key(path)
+                total = self.page_counts.get(path_key)
+                if total is None:
+                    raise ValueError(
+                        self.page_errors.get(path_key, "PDF is still being checked")
+                    )
                 start = int(row["from"].get().strip())
                 end = int(row["to"].get().strip())
                 range_error = validate_page_range(start, end, total)
@@ -1504,7 +1686,67 @@ class MRDPDFMerger:
                 failures.append(f"{label}: " + "; ".join(errors))
             elif selected:
                 jobs.append((kind, group_ui["group"], label, selected))
-        self._confirm_and_start_merge(jobs, failures, all_groups=True)
+        if not jobs:
+            self._confirm_and_start_merge(jobs, failures, all_groups=True)
+            return
+        selected_pdf_count = 0
+        selected_page_count = 0
+        review_count = 0
+        for kind, group_ui in all_groups:
+            checked_rows = [row for row in group_ui["rows"] if row["use"].get()]
+            selected_pdf_count += len(checked_rows)
+            if kind == "automatic" and group_ui["group"]["category"] == "review" and checked_rows:
+                review_count += 1
+            for row in checked_rows:
+                try:
+                    total = int(row["pages"].get())
+                    start = int(row["from"].get().strip())
+                    end = int(row["to"].get().strip())
+                except (TypeError, ValueError):
+                    continue
+                if validate_page_range(start, end, total) is None:
+                    selected_page_count += end - start + 1
+        summary = (
+            f"Eligible groups: {len(jobs)}\n"
+            f"Selected PDFs: {selected_pdf_count}\n"
+            f"Selected pages: {selected_page_count}\n"
+            f"Selected review-required groups: {review_count}"
+        )
+        decision = self._show_merge_all_summary(summary)
+        if decision != "proceed":
+            if decision == "review":
+                self.status_var.set("Merge All paused. Review selected groups, then try again.")
+            return
+        self._confirm_and_start_merge(jobs, failures, all_groups=True, confirmed=True)
+
+    def _show_merge_all_summary(self, summary):
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Review Merge All")
+        dialog.transient(self.root)
+        dialog.resizable(False, False)
+        result = {"choice": None}
+        ttk.Label(
+            dialog,
+            text="Merge All will create a separate PDF for each eligible group.\n\n" + summary,
+            justify="left", padding=16
+        ).pack(fill="both", expand=True)
+        actions = ttk.Frame(dialog, padding=(12, 0, 12, 12))
+        actions.pack(fill="x")
+
+        def choose(choice):
+            result["choice"] = choice
+            dialog.destroy()
+
+        ttk.Button(actions, text="Review First", command=lambda: choose("review")).pack(side="left")
+        ttk.Button(
+            actions, text="Proceed Anyway", style="Primary.TButton",
+            command=lambda: choose("proceed")
+        ).pack(side="right")
+        dialog.protocol("WM_DELETE_WINDOW", dialog.destroy)
+        dialog.grab_set()
+        dialog.update_idletasks()
+        dialog.wait_window()
+        return result["choice"]
 
     def merge_one_group(self, kind, group):
         if self._merge_running:
@@ -1523,14 +1765,11 @@ class MRDPDFMerger:
         jobs = [(kind, group, label, selected)] if selected and not errors else []
         self._confirm_and_start_merge(jobs, failures, all_groups=False)
 
-    def _confirm_and_start_merge(self, jobs, validation_failures, all_groups):
+    def _confirm_and_start_merge(self, jobs, validation_failures, all_groups, confirmed=False):
         if PdfReader is None or PdfWriter is None:
             messagebox.showerror(
                 "Missing package", "Install packages using:\npy -m pip install -r requirements.txt"
             )
-            return
-        if self.output_dir is None:
-            messagebox.showwarning("Output folder", "Choose an output folder first.")
             return
         if not jobs and not validation_failures:
             messagebox.showwarning("Nothing selected", "No checked PDFs are available to merge.")
@@ -1555,30 +1794,42 @@ class MRDPDFMerger:
             + "\n\nOnly checked PDFs will be included, in the displayed order and page ranges."
         )
         title = "Confirm all groups" if all_groups else "Confirm group merge"
-        if not messagebox.askyesno(title, prompt):
+        if not confirmed and not messagebox.askyesno(title, prompt):
             return
+
+        resolved_jobs = []
+        for kind, group, label, selection in jobs:
+            destination = source_folder_for_paths(group["files"])
+            if destination is None:
+                options = {"title": f"Choose output folder for {label}"}
+                if self.output_dir and self.output_dir.is_dir():
+                    options["initialdir"] = str(self.output_dir)
+                chosen = filedialog.askdirectory(**options)
+                if not chosen:
+                    self.status_var.set("Merge cancelled; no destination was selected.")
+                    return
+                destination = Path(chosen).resolve()
+            resolved_jobs.append((kind, group, label, selection, destination))
 
         self._merge_running = True
         self.merge_all_button.config(state="disabled")
         self.cleanup_button.config(state="disabled")
-        self.cleanup_clear_button.config(state="disabled")
         self.merge_progress["value"] = 0
         self.status_var.set("Merging PDFs. The application remains available while files are processed.")
-        output_dir = self.output_dir
         worker = threading.Thread(
             target=self._merge_worker,
-            args=(jobs, validation_failures, output_dir),
+            args=(resolved_jobs, validation_failures),
             daemon=True
         )
         worker.start()
         self.root.after(100, self._poll_merge_queue)
 
-    def _merge_worker(self, jobs, validation_failures, output_dir):
+    def _merge_worker(self, jobs, validation_failures):
         successes = []
         failures = list(validation_failures)
         failed_groups = []
         total_jobs = len(jobs)
-        for index, (kind, group, label, selected) in enumerate(jobs, start=1):
+        for index, (kind, group, label, selected, output_dir) in enumerate(jobs, start=1):
             self._merge_queue.put(("start", index, total_jobs, label))
             try:
                 def report_page_progress(completed, total):
@@ -1619,7 +1870,8 @@ class MRDPDFMerger:
                     self.cleanup_candidates = accumulate_cleanup_candidates(
                         self.cleanup_candidates, successes
                     )
-                    for _output, _sources, _label, kind, group in successes:
+                    for output, _sources, _label, kind, group in successes:
+                        self._generated_outputs.add(self._path_key(output))
                         widgets = self.group_widgets if kind == "automatic" else self.manual_group_widgets
                         group_ui = next((entry for entry in widgets if entry["group"] is group), None)
                         if group_ui is not None:
@@ -1632,16 +1884,14 @@ class MRDPDFMerger:
                     self._merge_running = False
                     self.refresh_cleanup_panel()
                     self.merge_all_button.config(state="normal")
-                    self.cleanup_clear_button.config(
-                        state=("normal" if self.cleanup_candidates else "disabled")
-                    )
                     self.merge_progress["value"] = 100 if successes else 0
                     message = (
                         f"Successfully created {len(successes)} merged PDF(s).\n"
                         f"Failed groups: {len(failures)}."
                     )
                     if successes:
-                        message += f"\n\nOutput folder:\n{self.output_dir}"
+                        output_folders = sorted({str(output.parent) for output, *_rest in successes})
+                        message += "\n\nOutput folder(s):\n" + "\n".join(output_folders)
                     if failures:
                         message += "\n\nNot merged:\n" + "\n".join(failures[:12])
                     if successes:

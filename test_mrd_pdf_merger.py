@@ -1,16 +1,27 @@
 import tempfile
+import time
+import tkinter as tk
 import unittest
 from pathlib import Path
 
 from pypdf import PdfReader, PdfWriter
 
+import mrd_pdf_merger as merger_module
 from mrd_pdf_merger import (
+    MRDPDFMerger,
     accumulate_cleanup_candidates,
     assign_source_to_group,
     cleanup_paths_from_successes,
+    get_name_tokens,
+    is_generated_output,
     make_groups,
     merge_pdf_selection,
     move_cleanup_sources_to_trash,
+    selected_items,
+    selection_page_count,
+    source_folder_for_paths,
+    source_folder_for_selection,
+    unmatched_source_paths,
     validate_page_range,
 )
 
@@ -38,6 +49,31 @@ class FilenameMatchingTests(unittest.TestCase):
             "ANANTA KUMAR DAS",
         )
 
+    def test_scanner_suffixes_and_document_labels_are_removed(self):
+        names = [
+            "ABHIMANYU SUTARA COVER.pdf",
+            "ABHIMANYU SUTARA S-5.pdf",
+            "ABHIMANYU SUTARA S-6.pdf",
+            "ABHIMANYU SUTARA S5.pdf",
+            "ABHIMANYU SUTARA S6.pdf",
+            "ABHIMANYU SUTARA S 5.pdf",
+            "ABHIMANYU SUTARA SCAN 5.pdf",
+            "ABHIMANYU SUTARA SCAN 6.pdf",
+            "ABHIMANYU SUTARA TUMOUR BOARD REPORT.pdf",
+            "ABHIMANYU SUTARA TUMOR BOARD 2026101410059243.pdf",
+        ]
+        self.assertEqual(get_name_tokens(names[0]), ["ABHIMANYU", "SUTARA"])
+        self.assert_patient_files_grouped(names, "ABHIMANYU SUTARA")
+
+    def test_requested_abhi_scan_file_is_an_exact_match(self):
+        groups = make_groups([
+            Path("ABHIMANYU SUTARA COVER.pdf"),
+            Path("ABHIMANYU SUTARA S-6 2026101410059243.pdf"),
+        ])
+        self.assertEqual(len(groups), 1)
+        self.assertEqual(groups[0]["category"], "confirmed")
+        self.assertEqual(groups[0]["level"], "Exact Match")
+
     def test_ratnakar_biswal_examples_share_one_group(self):
         self.assert_patient_files_grouped(
             [
@@ -59,20 +95,147 @@ class FilenameMatchingTests(unittest.TestCase):
         self.assertEqual(len(groups[0]["files"]), 2)
 
     def test_different_complete_names_do_not_match_on_first_name_alone(self):
-        groups = make_groups([
+        files = [
             Path("ANANTA KUMAR DAS COVER.pdf"),
             Path("ANANTA KUMAR ROUT COVER.pdf"),
+        ]
+        groups = make_groups(files)
+        self.assertEqual(groups, [])
+        self.assertEqual(
+            {path.name for path in unmatched_source_paths(files, groups)},
+            {"ANANTA KUMAR DAS COVER.pdf", "ANANTA KUMAR ROUT COVER.pdf"},
+        )
+
+    def test_single_pdf_is_unmatched_not_review_required(self):
+        source = Path("SINGLE PATIENT COVER.pdf")
+        groups = make_groups([source])
+        self.assertEqual(groups, [])
+        self.assertEqual(unmatched_source_paths([source], groups), [source])
+
+    def test_right_panel_groups_only_contain_confirmed_or_review_categories(self):
+        groups = make_groups([
+            Path("PATIENT ONE COVER.pdf"),
+            Path("PATIENT ONE REPORT.pdf"),
+            Path("PATIENT TWO COVER.pdf"),
+            Path("PATIENT THREE SOLO.pdf"),
+            Path("PATIENT THREE SOLO REPORT.pdf"),
         ])
-        self.assertEqual(len(groups), 2)
-        self.assertTrue(all(group["level"] == "Review Required" for group in groups))
+        self.assertTrue(groups)
+        self.assertTrue(all(group["category"] in {"confirmed", "review"} for group in groups))
+        self.assertTrue(any(path.name == "PATIENT TWO COVER.pdf"
+                            for path in unmatched_source_paths(
+                                [Path("PATIENT TWO COVER.pdf")], groups)))
+
+    def test_checkbox_selection_and_inclusive_page_totals(self):
+        first = (Path("first.pdf"), 2, 4)
+        unchecked = (Path("unchecked.pdf"), 1, 10)
+        second = (Path("second.pdf"), 1, 1)
+        selected = selected_items([(True, first), (False, unchecked), (True, second)])
+        self.assertEqual(selected, [first, second])
+        self.assertEqual(selection_page_count(selected), 4)
+
+    def test_generated_merged_outputs_are_recognized(self):
+        self.assertTrue(is_generated_output(Path("Patient_MERGED.pdf")))
+        self.assertTrue(is_generated_output(Path("Patient_MERGED_2.PDF")))
+        self.assertFalse(is_generated_output(Path("Patient_Report.pdf")))
 
     def test_shared_prefix_with_different_tokens_is_not_a_fuzzy_match(self):
         groups = make_groups([
             Path("UNRELATED ONE COVER.pdf"),
             Path("UNRELATED TWO REPORT.pdf"),
         ])
-        self.assertEqual(len(groups), 2)
-        self.assertTrue(all(group["level"] == "Review Required" for group in groups))
+        self.assertEqual(groups, [])
+
+
+class ApplicationWorkflowTests(unittest.TestCase):
+    def test_unmatched_files_stay_in_explorer_and_merge_all_includes_review_groups(self):
+        root = tk.Tk()
+        root.withdraw()
+        app = MRDPDFMerger(root)
+        original_showinfo = merger_module.messagebox.showinfo
+        summary_prompts = []
+        merger_module.messagebox.showinfo = lambda *_args, **_kwargs: None
+        try:
+            with tempfile.TemporaryDirectory() as temp:
+                source_dir = Path(temp)
+                sources = [
+                    source_dir / "NAZIA KHARAM COVER.pdf",
+                    source_dir / "NAZIA KHANAM REPORT.pdf",
+                    source_dir / "UNMATCHED SYNTHETIC PERSON.pdf",
+                ]
+                for source in sources:
+                    writer = PdfWriter()
+                    writer.add_blank_page(width=100, height=100)
+                    with source.open("wb") as stream:
+                        writer.write(stream)
+
+                app._add_paths([source_dir])
+                self.assertEqual(
+                    {group["category"] for group in app.groups},
+                    {"review"},
+                )
+                self.assertTrue(all(
+                    group["category"] in {"confirmed", "review"}
+                    for group in app.groups
+                ))
+                self.assertEqual(len(app.group_widgets), 1)
+                self.assertEqual(len(app._tree_file_paths), 3)
+                self.assertIn("1 unmatched PDFs", app.match_summary_var.get())
+
+                app.create_manual_group()
+                manual = app.manual_groups[-1]
+                unmatched = sources[-1]
+                source_iid = next(
+                    iid for iid, path in app._tree_file_paths.items()
+                    if app._same_path(path, unmatched)
+                )
+                app.all_files_list.selection_set(source_iid)
+                app.add_selected_to_manual(manual)
+                self.assertEqual(manual["files"], [unmatched])
+                self.assertEqual(len(app.group_widgets), 1)
+
+                deadline = time.time() + 5
+                while app._page_tasks and time.time() < deadline:
+                    root.update()
+                    time.sleep(0.01)
+                self.assertFalse(app._page_tasks)
+                review_ui = app.group_widgets[0]
+                for row in review_ui["rows"]:
+                    row["use"].set(True)
+                app._show_merge_all_summary = lambda text: (
+                    summary_prompts.append(text) or "proceed"
+                )
+                app.merge_all()
+                deadline = time.time() + 10
+                while app._merge_running and time.time() < deadline:
+                    root.update()
+                    time.sleep(0.01)
+                self.assertFalse(app._merge_running)
+                self.assertEqual(len(summary_prompts), 1)
+                self.assertIn("Eligible groups: 2", summary_prompts[0])
+                self.assertIn("Selected PDFs: 3", summary_prompts[0])
+                self.assertIn("Selected review-required groups: 1", summary_prompts[0])
+                outputs = list(source_dir.glob("*_MERGED*.pdf"))
+                self.assertEqual(len(outputs), 2)
+                self.assertEqual(len(app.cleanup_candidates), 3)
+                self.assertTrue(all(source.exists() for source in sources))
+                app._add_paths([source_dir])
+                self.assertEqual(len(app.files), 3)
+                self.assertEqual(len(app.cleanup_candidates), 3)
+                extra_folder = source_dir / "additional"
+                extra_folder.mkdir()
+                extra_source = extra_folder / "ANOTHER SYNTHETIC PERSON.pdf"
+                writer = PdfWriter()
+                writer.add_blank_page(width=100, height=100)
+                with extra_source.open("wb") as stream:
+                    writer.write(stream)
+                app._add_paths([extra_folder])
+                self.assertIn(manual, app.manual_groups)
+                self.assertEqual(len(app.cleanup_candidates), 3)
+                self.assertEqual(len(app.files), 4)
+        finally:
+            merger_module.messagebox.showinfo = original_showinfo
+            root.destroy()
 
 
 class AssignmentTests(unittest.TestCase):
@@ -86,6 +249,17 @@ class AssignmentTests(unittest.TestCase):
         self.assertEqual(manual["files"], [source])
         self.assertFalse(assign_source_to_group(source, [automatic, manual], manual))
         self.assertEqual(manual["files"], [source])
+
+    def test_multiple_manual_groups_keep_independent_sources(self):
+        first, second = Path("left/first.pdf"), Path("right/second.pdf")
+        automatic = {"files": []}
+        manual_one, manual_two = {"files": []}, {"files": []}
+        groups = [automatic, manual_one, manual_two]
+        self.assertTrue(assign_source_to_group(first, groups, manual_one))
+        self.assertTrue(assign_source_to_group(second, groups, manual_two))
+        self.assertEqual(manual_one["files"], [first])
+        self.assertEqual(manual_two["files"], [second])
+        self.assertEqual(automatic["files"], [])
 
 
 class MergeEngineTests(unittest.TestCase):
@@ -136,6 +310,51 @@ class MergeEngineTests(unittest.TestCase):
 
         self.assertEqual(existing.read_bytes(), b"keep this existing file")
         self.assertEqual(output.name, "Patient_MERGED_2.pdf")
+
+    def test_same_folder_group_outputs_to_its_source_folder(self):
+        source_folder = self.root / "nested" / "patient"
+        source_folder.mkdir(parents=True)
+        source = source_folder / "Source.pdf"
+        writer = PdfWriter()
+        writer.add_blank_page(width=100, height=100)
+        with source.open("wb") as stream:
+            writer.write(stream)
+
+        destination = source_folder_for_selection([(source, 1, 1)])
+        output, included = merge_pdf_selection([(source, 1, 1)], destination, "Patient")
+
+        self.assertEqual(destination, source_folder.resolve())
+        self.assertEqual(output.parent.resolve(), source_folder.resolve())
+        self.assertEqual(included, [source])
+
+    def test_cross_folder_group_requires_an_explicit_destination(self):
+        first = self.make_pdf("First.pdf", [100])
+        second_folder = self.root / "nested"
+        second_folder.mkdir()
+        second = second_folder / "Second.pdf"
+        writer = PdfWriter()
+        writer.add_blank_page(width=100, height=100)
+        with second.open("wb") as stream:
+            writer.write(stream)
+        selection = [(first, 1, 1), (second, 1, 1)]
+
+        self.assertIsNone(source_folder_for_selection(selection))
+        self.assertIsNone(source_folder_for_paths([first, second]))
+        chosen_destination = self.root / "user-chosen"
+        output, _included = merge_pdf_selection(selection, chosen_destination, "Patient")
+        self.assertEqual(output.parent, chosen_destination)
+
+    def test_unchecked_group_source_still_requires_cross_folder_destination(self):
+        checked = self.make_pdf("Checked.pdf", [100])
+        unchecked_folder = self.root / "unchecked"
+        unchecked_folder.mkdir()
+        unchecked = unchecked_folder / "Unchecked.pdf"
+        writer = PdfWriter()
+        writer.add_blank_page(width=100, height=100)
+        with unchecked.open("wb") as stream:
+            writer.write(stream)
+
+        self.assertIsNone(source_folder_for_paths([checked, unchecked]))
 
     def test_invalid_or_missing_selected_pdf_leaves_no_output(self):
         source = self.make_pdf("Valid.pdf", [100])
