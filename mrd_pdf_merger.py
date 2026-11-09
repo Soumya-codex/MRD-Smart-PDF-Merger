@@ -9,6 +9,7 @@ from difflib import SequenceMatcher
 from tkinter import ttk, filedialog, messagebox
 from pathlib import Path
 from collections import defaultdict
+from dataclasses import dataclass, field
 
 try:
     from pypdf import PdfReader, PdfWriter
@@ -29,120 +30,338 @@ except ImportError:
     send2trash = None
 
 
-# Words commonly found in filenames that describe document type, not patient identity.
+# Words commonly found in filenames that describe documents, not patient identity.
 DOC_LABELS = {
-    "COVER", "SCAN", "SCANNED", "COPY", "FINAL", "PDF", "REPORT",
-    "DOCUMENT", "DOC", "DISCHARGE", "SUMMARY", "TUMOUR", "TUMOR", "BOARD",
+    "COVER", "SCAN", "SCANNED", "COPY", "FINAL", "PDF", "REPORT", "CT", "NCCT",
+    "MRI", "USG", "XRAY", "X", "RAY", "DOCUMENT", "DOC", "DISCHARGE",
+    "SUMMARY", "TUMOUR", "TUMOR", "BOARD", "DATE", "DOB", "DOV", "VISIT",
+    "VISITDATE", "VIS", "VST", "MOBILE", "MOB", "PHONE", "PH", "UHID", "EP", "MRN",
 }
 GENERIC_PREFIXES = {"BABY", "OF"}
 DOCUMENT_PHRASES = (
-    "DISCHARGE SUMMARY", "TUMOUR BOARD", "TUMOR BOARD",
+    "DISCHARGE SUMMARY", "TUMOUR BOARD", "TUMOR BOARD", "X-RAY",
 )
+MERGED_OUTPUT_DIRECTORY = "Merged_PDFs"
+
+IDENTIFIER_PATTERNS = (
+    ("UHID", re.compile(r"\bUHID[\s:_#-]*([A-Z0-9]*\d[A-Z0-9]*)\b")),
+    ("EP", re.compile(r"\bEP[\s:_#-]*([A-Z0-9]*\d[A-Z0-9]*)\b")),
+    ("MRN", re.compile(r"\bMRN[\s:_#-]*([A-Z0-9]*\d[A-Z0-9]*)\b")),
+    ("VISIT", re.compile(r"\b(?:VISIT|VST|VIS)[\s:_#-]*([A-Z0-9]*\d[A-Z0-9]*)\b")),
+    ("MOBILE", re.compile(r"\b(?:MOBILE|MOB|PHONE|PH)[\s:_#-]*(\+?\d[\d-]{7,}\d)\b")),
+)
+STRONG_IDENTIFIER_TYPES = {"UHID"}
+SUPPORTING_IDENTIFIER_TYPES = {"EP", "MRN", "VISIT", "MOBILE", "DATE"}
+
+
+@dataclass(frozen=True)
+class MatchingConfig:
+    token_similarity_threshold: float = 0.78
+    fuzzy_token_threshold: float = 0.78
+    minimum_fuzzy_name_similarity: float = 0.78
+    shared_uhid_name_similarity: float = 0.35
+    supporting_identifier_name_similarity: float = 0.68
+    first_middle_minimum_tokens: int = 3
+
+    def __post_init__(self):
+        score_fields = (
+            "token_similarity_threshold",
+            "fuzzy_token_threshold",
+            "minimum_fuzzy_name_similarity",
+            "shared_uhid_name_similarity",
+            "supporting_identifier_name_similarity",
+        )
+        if any(not 0 <= getattr(self, field_name) <= 1 for field_name in score_fields):
+            raise ValueError("Matching score thresholds must be between 0 and 1.")
+        if self.first_middle_minimum_tokens < 3:
+            raise ValueError("first_middle_minimum_tokens must be at least 3.")
+
+
+@dataclass(frozen=True)
+class FilenameIdentity:
+    tokens: tuple
+    identifiers: dict = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class PairAssessment:
+    stage: str
+    confidence: float
+
+
+DEFAULT_MATCHING_CONFIG = MatchingConfig()
+
+
+def extract_filename_identity(path_or_name):
+    """Extract normalized name tokens and identifiers carried in a filename."""
+    stem = Path(path_or_name).stem.upper()
+    identifiers = defaultdict(set)
+
+    for identifier_type, pattern in IDENTIFIER_PATTERNS:
+        def remove_identifier(match, kind=identifier_type):
+            value = match.group(1).upper()
+            identifiers[kind].add(
+                re.sub(r"\D", "", value) if kind == "MOBILE" else value
+            )
+            return " "
+
+        stem = pattern.sub(remove_identifier, stem)
+
+    date_pattern = re.compile(
+        r"\b(?:DATE|DOB|DOV|VISITDATE)[\s:_#-]*"
+        r"(\d{4}[-/]\d{2}[-/]\d{2}|\d{2}[-/]\d{2}[-/]\d{4}|\d{8,20})\b"
+    )
+
+    def remove_date(match):
+        identifiers["DATE"].add(re.sub(r"\D", "", match.group(1)))
+        return " "
+
+    stem = date_pattern.sub(remove_date, stem)
+
+    # Recognize the scanner's S5/SCAN-5 suffixes without discarding a lone S
+    # inside a patient name.
+    stem = re.sub(r"\b(?:S|SCAN(?:NED)?)\s*[-_]?\s*\d+\b", " ", stem)
+    stem = re.sub(r"\b(?:UHID|EP|MRN|VISIT|VST|VIS|MOBILE|MOB|PHONE|PH)\b", " ", stem)
+
+    # Remove standalone dates, phone-like numbers, and other numeric identifiers.
+    for match in re.finditer(r"(?<![A-Z0-9])\d{8,20}(?![A-Z0-9])", stem):
+        identifiers["DATE"].add(match.group())
+    stem = re.sub(r"(?<![A-Z0-9])\d{8,20}(?![A-Z0-9])", " ", stem)
+    for match in re.finditer(r"(?<!\d)\+?\d[\d-]{8,13}\d(?!\d)", stem):
+        identifiers["MOBILE"].add(re.sub(r"\D", "", match.group()))
+    stem = re.sub(r"\b[A-Z0-9]*\d[A-Z0-9]*\b", " ", stem)
+
+    for phrase in sorted(DOCUMENT_PHRASES, key=len, reverse=True):
+        stem = re.sub(rf"\b{re.escape(phrase)}\b", " ", stem)
+    stem = re.sub(r"\bX[\s_-]*RAY\b", " ", stem)
+    stem = re.sub(r"COVER$", " ", stem)
+
+    tokens = re.findall(r"[A-Z]+", re.sub(r"[^A-Z]+", " ", stem))
+    tokens = [token for token in tokens if token not in DOC_LABELS]
+    if len(tokens) >= 3 and tokens[-1] == "S":
+        tokens.pop()
+    while tokens and tokens[0] in GENERIC_PREFIXES:
+        tokens.pop(0)
+    return FilenameIdentity(
+        tuple(tokens),
+        {kind: frozenset(values) for kind, values in identifiers.items()},
+    )
 
 
 def get_name_tokens(path_or_name):
-    """Extract patient-name tokens while removing known document labels/suffixes."""
-    stem = Path(path_or_name).stem.upper()
-
-    for phrase in DOCUMENT_PHRASES:
-        stem = re.sub(rf"\b{phrase}\b", " ", stem)
-
-    # Remove scanner IDs before punctuation normalization so S-5 and S 5
-    # cannot leave a stray "S" token in the patient's name.
-    stem = re.sub(r"\b(?:S|SCAN(?:NED)?)\s*[-_]?\s*\d+\b", " ", stem)
-    # Dates, timestamps, and numeric identifiers are not patient-name tokens.
-    stem = re.sub(r"\b[A-Z0-9]*\d[A-Z0-9]*\b", " ", stem)
-    stem = re.sub(r"\b\d+\b", " ", stem)
-    stem = re.sub(r"[^A-Z]+", " ", stem)
-    tokens = re.findall(r"[A-Z]+", stem)
-    tokens = [t for t in tokens if t not in DOC_LABELS]
-    while tokens and tokens[0] in GENERIC_PREFIXES:
-        tokens.pop(0)
-    return tokens
+    """Return patient-name tokens after removing document and identifier metadata."""
+    return list(extract_filename_identity(path_or_name).tokens)
 
 
 def patient_key(path):
     return tuple(get_name_tokens(path.name))
 
 
-def make_groups(files):
-    """Create exact groups plus high-confidence, review-only fuzzy suggestions."""
-    buckets = defaultdict(list)
-    for p in files:
-        key = patient_key(p)
-        if key:
-            buckets[key].append(p)
-        else:
-            # Files with no usable alphabetic name remain individually visible.
-            buckets[("__UNMATCHED__", p.name)].append(p)
+def _name_similarity(first, second):
+    first_name = " ".join(first.tokens)
+    second_name = " ".join(second.tokens)
+    character_similarity = SequenceMatcher(None, first_name, second_name).ratio()
+    token_similarity = SequenceMatcher(None, first.tokens, second.tokens).ratio()
+    first_set, second_set = set(first.tokens), set(second.tokens)
+    union = first_set | second_set
+    overlap = len(first_set & second_set) / len(union) if union else 0
+    return character_similarity, max(token_similarity, overlap)
+
+
+def _shared_identifiers(first, second, identifier_types):
+    return any(
+        first.identifiers.get(identifier_type, frozenset())
+        & second.identifiers.get(identifier_type, frozenset())
+        for identifier_type in identifier_types
+    )
+
+
+def _assess_pair(first, second, config):
+    if not first.tokens or not second.tokens:
+        return None
+
+    first_uhids = first.identifiers.get("UHID", frozenset())
+    second_uhids = second.identifiers.get("UHID", frozenset())
+    if first_uhids and second_uhids and not first_uhids.intersection(second_uhids):
+        return None
+
+    if first.tokens == second.tokens:
+        return PairAssessment("Exact normalized name", 1.0)
+
+    character_similarity, token_similarity = _name_similarity(first, second)
+    if (
+        len(first.tokens) >= config.first_middle_minimum_tokens
+        and len(second.tokens) >= config.first_middle_minimum_tokens
+        and first.tokens[:-1] == second.tokens[:-1]
+    ):
+        return PairAssessment("First/middle names agree; surname differs", 0.9)
+
+    shared_uhid = _shared_identifiers(first, second, STRONG_IDENTIFIER_TYPES)
+    shared_supporting_id = _shared_identifiers(first, second, SUPPORTING_IDENTIFIER_TYPES)
+    if shared_uhid and character_similarity >= config.shared_uhid_name_similarity:
+        return PairAssessment("Shared UHID supports the name match", character_similarity)
+
+    if (
+        len(first.tokens) == len(second.tokens)
+        and len(first.tokens) >= 2
+    ):
+        differing_tokens = [
+            (left, right)
+            for left, right in zip(first.tokens, second.tokens)
+            if left != right
+        ]
+        if (
+            len(differing_tokens) == 1
+            and min(map(len, differing_tokens[0])) >= 4
+            and SequenceMatcher(None, *differing_tokens[0]).ratio()
+            >= config.fuzzy_token_threshold
+            and character_similarity >= config.minimum_fuzzy_name_similarity
+        ):
+            return PairAssessment("Possible spelling variation", character_similarity)
+
+    if (
+        token_similarity >= config.token_similarity_threshold
+        and len(set(first.tokens) & set(second.tokens)) >= 2
+    ):
+        return PairAssessment("High token similarity", token_similarity)
+
+    if (
+        shared_supporting_id
+        and character_similarity >= config.supporting_identifier_name_similarity
+    ):
+        return PairAssessment("Shared supporting identifier", character_similarity)
+    return None
+
+
+def _path_sort_key(path):
+    return path.parent.as_posix().lower(), path.name.lower()
+
+
+def make_groups(files, config=DEFAULT_MATCHING_CONFIG):
+    """Group exact identities and place uncertain, ID-compatible candidates in review."""
+    profiles = []
+    seen_paths = set()
+    for path in files:
+        path_key = str(path.resolve()).casefold()
+        if path_key in seen_paths:
+            continue
+        seen_paths.add(path_key)
+        profiles.append((path, extract_filename_identity(path.name)))
+
+    uhids_by_name = defaultdict(set)
+    for profile in profiles:
+        identity = profile[1]
+        if identity.tokens:
+            uhids_by_name[identity.tokens].update(
+                identity.identifiers.get("UHID", frozenset())
+            )
+    ambiguous_names = {
+        name for name, uhids in uhids_by_name.items() if len(uhids) > 1
+    }
+
+    eligible = [
+        index for index, profile in enumerate(profiles)
+        if profile[1].tokens
+        and not (
+            profile[1].tokens in ambiguous_names
+            and not profile[1].identifiers.get("UHID")
+        )
+    ]
+    assessments = {}
+    adjacency = defaultdict(set)
+    for position, first_index in enumerate(eligible):
+        for second_index in eligible[position + 1:]:
+            assessment = _assess_pair(
+                profiles[first_index][1], profiles[second_index][1], config
+            )
+            if assessment is not None:
+                assessments[first_index, second_index] = assessment
+                adjacency[first_index].add(second_index)
+                adjacency[second_index].add(first_index)
 
     groups = []
-    matched_keys = set()
-    named_keys = [key for key in buckets if key[0] != "__UNMATCHED__"]
+    visited = set()
+    for start in eligible:
+        if start in visited or not adjacency[start]:
+            continue
 
-    # Exact complete cleaned names are grouped without relying on folder names.
-    for key in named_keys:
-        if len(buckets[key]) > 1:
+        component = set()
+        pending = [start]
+        while pending:
+            current = pending.pop()
+            if current in component:
+                continue
+            component.add(current)
+            pending.extend(adjacency[current] - component)
+        visited.update(component)
+
+        remaining = set(component)
+        while remaining:
+            seed = max(
+                remaining,
+                key=lambda index: (
+                    len(adjacency[index] & remaining),
+                    profiles[index][1].tokens,
+                    _path_sort_key(profiles[index][0]),
+                ),
+            )
+            members = [seed]
+            candidates = sorted(
+                adjacency[seed] & remaining - {seed},
+                key=lambda index: (
+                    -assessments[tuple(sorted((seed, index)))].confidence,
+                    profiles[index][1].tokens,
+                    _path_sort_key(profiles[index][0]),
+                ),
+            )
+            for candidate in candidates:
+                if all(
+                    tuple(sorted((candidate, member))) in assessments
+                    for member in members
+                ):
+                    members.append(candidate)
+
+            remaining.difference_update(members)
+            if len(members) < 2:
+                continue
+
+            pair_assessments = [
+                assessments[tuple(sorted((first, second)))]
+                for position, first in enumerate(members)
+                for second in members[position + 1:]
+            ]
+            exact = all(
+                assessment.stage == "Exact normalized name"
+                for assessment in pair_assessments
+            )
+            name_counts = defaultdict(int)
+            for index in members:
+                name_counts[profiles[index][1].tokens] += 1
+            key = min(
+                name_counts,
+                key=lambda name: (-name_counts[name], name),
+            )
+            confidence = min(item.confidence for item in pair_assessments)
+            if exact:
+                level = "Exact Match"
+                category = "confirmed"
+                confidence = 1.0
+            else:
+                reasons = sorted({
+                    assessment.stage for assessment in pair_assessments
+                    if assessment.stage != "Exact normalized name"
+                })
+                level = (
+                    f"Possible Match ({', '.join(reasons)}) — Review Required"
+                )
+                category = "review"
             groups.append({
                 "key": key,
-                "files": sorted(buckets[key], key=lambda path: (path.parent.as_posix().lower(), path.name.lower())),
-                "level": "Exact Match",
-                "category": "confirmed",
-                "confidence": 1.0,
+                "files": sorted((profiles[index][0] for index in members), key=_path_sort_key),
+                "level": level,
+                "category": category,
+                "confidence": confidence,
             })
-            matched_keys.add(key)
-
-    # Fuzzy comparison is only used for complete names with at least two tokens.
-    # A mutual-best thresholded pair is suggested for review, never auto-confirmed.
-    singleton_keys = [key for key in named_keys if key not in matched_keys]
-    similarities = {}
-    for first_index, first_key in enumerate(singleton_keys):
-        first_name = " ".join(first_key)
-        if len(first_key) < 2:
-            continue
-        for second_key in singleton_keys[first_index + 1:]:
-            if len(second_key) < 2:
-                continue
-            second_name = " ".join(second_key)
-            score = SequenceMatcher(None, first_name, second_name).ratio()
-            token_scores = [
-                SequenceMatcher(None, left, right).ratio()
-                for left, right in zip(first_key, second_key)
-            ]
-            changed_tokens = [
-                (left, right, token_score)
-                for left, right, token_score in zip(first_key, second_key, token_scores)
-                if left != right
-            ]
-            safe_single_typo = (
-                len(changed_tokens) == 1
-                and min(len(changed_tokens[0][0]), len(changed_tokens[0][1])) >= 4
-                and changed_tokens[0][2] >= 0.78
-            )
-            if score >= 0.84 and len(first_key) == len(second_key) and safe_single_typo:
-                similarities[first_key, second_key] = score
-
-    best_for_key = {}
-    for (first_key, second_key), score in similarities.items():
-        best_for_key[first_key] = max(score, best_for_key.get(first_key, 0))
-        best_for_key[second_key] = max(score, best_for_key.get(second_key, 0))
-    for (first_key, second_key), score in similarities.items():
-        if score != best_for_key[first_key] or score != best_for_key[second_key]:
-            continue
-        if first_key in matched_keys or second_key in matched_keys:
-            continue
-        files_for_pair = sorted(
-            buckets[first_key] + buckets[second_key],
-            key=lambda path: (path.parent.as_posix().lower(), path.name.lower()),
-        )
-        groups.append({
-            "key": first_key,
-            "files": files_for_pair,
-            "level": f"Possible Match ({score:.0%}) — Review Required",
-            "category": "review",
-            "confidence": score,
-        })
-        matched_keys.update((first_key, second_key))
 
     groups.sort(key=lambda group: " ".join(group["key"]).lower())
     return groups
@@ -156,7 +375,7 @@ def validate_page_range(start, end, total):
 
 
 def source_folder_for_selection(selection):
-    """Return a shared source folder, or None when a destination must be chosen."""
+    """Return a shared source folder, or None when the sources span folders."""
     return source_folder_for_paths(path for path, _start, _end in selection)
 
 
@@ -216,6 +435,16 @@ def accumulate_cleanup_candidates(existing, successes):
             candidates[str(path)] = path
             seen.add(key)
     return candidates
+
+
+def merged_output_directories(source_paths):
+    """Return one Merged_PDFs destination inside each source folder."""
+    directories = {
+        str(Path(path).resolve().parent / MERGED_OUTPUT_DIRECTORY).casefold():
+        Path(path).resolve().parent / MERGED_OUTPUT_DIRECTORY
+        for path in source_paths
+    }
+    return [directories[key] for key in sorted(directories)]
 
 
 def move_cleanup_sources_to_trash(candidates, trash_function):
@@ -326,6 +555,51 @@ def merge_pdf_selection(selection, output_dir, group_name, progress_callback=Non
             pass
 
 
+def merge_pdf_selection_to_folders(
+    selection, output_dirs, group_name, progress_callback=None
+):
+    """Create the same group merge in every requested output folder."""
+    output_dirs = list(output_dirs)
+    if not output_dirs:
+        raise ValueError("No source folders are available for merged outputs.")
+
+    outputs = []
+    included_sources = None
+    try:
+        for index, output_dir in enumerate(output_dirs):
+            def report_folder_progress(completed, total):
+                if progress_callback:
+                    progress_callback(
+                        index * total + completed,
+                        total * len(output_dirs),
+                    )
+
+            output, included = merge_pdf_selection(
+                selection,
+                output_dir,
+                group_name,
+                progress_callback=report_folder_progress,
+            )
+            outputs.append(output)
+            if included_sources is None:
+                included_sources = included
+    except Exception as exc:
+        rollback_errors = []
+        for output in outputs:
+            try:
+                output.unlink()
+            except OSError as rollback_error:
+                rollback_errors.append(f"{output}: {rollback_error}")
+        if rollback_errors:
+            raise RuntimeError(
+                f"{exc}; could not remove partial merged output(s): "
+                + "; ".join(rollback_errors)
+            ) from exc
+        raise
+
+    return outputs, included_sources
+
+
 class MRDPDFMerger:
     def __init__(self, root):
         self.root = root
@@ -354,7 +628,6 @@ class MRDPDFMerger:
         self._page_polling = False
         self._merge_running = False
         self.dnd_enabled = False
-        self.output_dir = None
         # Candidates accumulate through the current source-processing session.
         self.cleanup_candidates = {}
         self._build_ui()
@@ -409,8 +682,9 @@ class MRDPDFMerger:
         self.total_pages_var = tk.StringVar(value="0 pages")
         ttk.Label(toolbar, textvariable=self.total_pages_var).pack(side="left", padx=6)
 
-        self.output_var = tk.StringVar(value="Same-folder outputs; choose destination for mixed folders")
-        ttk.Button(toolbar, text="Output Folder", command=self.choose_output).pack(side="right")
+        self.output_var = tk.StringVar(
+            value=f"Merged PDFs: {MERGED_OUTPUT_DIRECTORY} under each source folder"
+        )
 
         self.drop_area = tk.Label(
             self.root,
@@ -451,9 +725,11 @@ class MRDPDFMerger:
         # Set the initial divider near the requested 40/60 proportion.
         self.root.after(250, lambda: workspace.sashpos(0, int(self.root.winfo_width() * 0.4)))
 
+        left_sections = ttk.Panedwindow(left_panel, orient="vertical")
+        left_sections.pack(fill="both", expand=True)
+
         # Left upper section: folder hierarchy and every discovered source PDF.
-        all_box = ttk.LabelFrame(left_panel, text="Original PDFs by folder", padding=7)
-        all_box.pack(fill="both", expand=True, pady=(0, 7))
+        all_box = ttk.LabelFrame(left_sections, text="Original PDFs by folder", padding=7)
         self.all_count_var = tk.StringVar(value="0 files")
         ttk.Label(all_box, textvariable=self.all_count_var, foreground="#555").pack(anchor="w")
         self.filename_search_var = tk.StringVar()
@@ -501,8 +777,103 @@ class MRDPDFMerger:
         ttk.Label(all_box, textvariable=self.selected_source_var, foreground="#17365d",
                   wraplength=500).pack(anchor="w", pady=(3, 0))
 
-        manual_box = ttk.LabelFrame(left_panel, text="Manual Groups", padding=7)
-        manual_box.pack(fill="both", expand=True, pady=(0, 7))
+        # Left lower section: cleanup candidates from successful merges only.
+        cleanup_box = ttk.LabelFrame(left_sections, text="Original PDFs ready for cleanup", padding=7)
+        ttk.Label(
+            cleanup_box,
+            text="Only PDFs used in successfully created merged files appear here.",
+            foreground="#555", wraplength=480
+        ).pack(anchor="w")
+        cleanup_tools = ttk.Frame(cleanup_box)
+        cleanup_tools.pack(fill="x", pady=(5, 2))
+        ttk.Button(cleanup_tools, text="Select all", command=lambda: self.set_cleanup_checks(True)).pack(side="left")
+        ttk.Button(cleanup_tools, text="Select none", command=lambda: self.set_cleanup_checks(False)).pack(side="left", padx=5)
+        self.cleanup_selected_var = tk.StringVar(value="0 selected")
+        ttk.Label(cleanup_tools, textvariable=self.cleanup_selected_var).pack(side="right")
+        self.cleanup_button = ttk.Button(
+            cleanup_box, text="Move Selected to Recycle Bin",
+            style="Danger.TButton",
+            command=self.cleanup_selected_originals
+        )
+        self.cleanup_button.pack(fill="x", pady=(0, 4))
+
+        cleanup_list_wrap = ttk.Frame(cleanup_box)
+        cleanup_list_wrap.pack(fill="both", expand=True)
+        self.cleanup_canvas = tk.Canvas(
+            cleanup_list_wrap, highlightthickness=0, height=150, background="#f3f6fa"
+        )
+        cleanup_scroll = ttk.Scrollbar(cleanup_list_wrap, orient="vertical", command=self.cleanup_canvas.yview)
+        self.cleanup_canvas.configure(yscrollcommand=cleanup_scroll.set)
+        self.cleanup_canvas.pack(side="left", fill="both", expand=True)
+        cleanup_scroll.pack(side="right", fill="y")
+        self.cleanup_rows_frame = ttk.Frame(self.cleanup_canvas)
+        self.cleanup_canvas_window = self.cleanup_canvas.create_window(
+            (0, 0), window=self.cleanup_rows_frame, anchor="nw"
+        )
+        self.cleanup_rows_frame.bind(
+            "<Configure>",
+            lambda _e: self.cleanup_canvas.configure(scrollregion=self.cleanup_canvas.bbox("all"))
+        )
+        self.cleanup_canvas.bind(
+            "<Configure>",
+            lambda e: self.cleanup_canvas.itemconfigure(self.cleanup_canvas_window, width=e.width)
+        )
+        self.cleanup_empty_var = tk.StringVar(value="No cleanup candidates yet. Merge PDFs first.")
+        self.cleanup_empty_label = ttk.Label(cleanup_box, textvariable=self.cleanup_empty_var, foreground="#666")
+        self.cleanup_empty_label.pack(anchor="w", pady=(3, 5))
+
+        left_sections.add(all_box, weight=4)
+        left_sections.add(cleanup_box, weight=3)
+
+        def position_left_sections():
+            height = left_sections.winfo_height()
+            left_sections.sashpos(0, int(height * 0.48))
+
+        self.root.after(300, position_left_sections)
+
+        # Right side: matching cards above manual groups.
+        right_sections = ttk.Panedwindow(right_panel, orient="vertical")
+        right_sections.pack(fill="both", expand=True)
+        match_panel = ttk.Frame(right_sections)
+        manual_box = ttk.LabelFrame(right_sections, text="Manual Groups", padding=7)
+        right_sections.add(match_panel, weight=7)
+        right_sections.add(manual_box, weight=3)
+
+        match_tools = ttk.Frame(match_panel)
+        match_tools.pack(fill="x", pady=(0, 5))
+        self.match_summary_var = tk.StringVar(value="0 source PDFs  |  0 confirmed groups  |  0 review groups  |  0 unmatched PDFs")
+        ttk.Label(
+            match_panel, textvariable=self.match_summary_var,
+            foreground="#5c6b7a", wraplength=720
+        ).pack(anchor="w", pady=(0, 5))
+        ttk.Label(match_tools, text="Patient search:").pack(side="left")
+        self.patient_search_var = tk.StringVar()
+        ttk.Entry(match_tools, textvariable=self.patient_search_var, width=28).pack(side="left", padx=(5, 10))
+        ttk.Label(match_tools, text="Show:").pack(side="left")
+        self.match_filter_var = tk.StringVar(value="All")
+        ttk.Combobox(
+            match_tools, textvariable=self.match_filter_var, state="readonly",
+            values=("All", "Confirmed Matches", "Review Required"),
+            width=18
+        ).pack(side="left", padx=5)
+        self.patient_search_var.trace_add("write", lambda *_args: self._apply_group_filters())
+        self.match_filter_var.trace_add("write", lambda *_args: self._apply_group_filters())
+        cards_outer = ttk.Frame(match_panel)
+        cards_outer.pack(fill="both", expand=True)
+        cards_outer.rowconfigure(0, weight=1)
+        cards_outer.columnconfigure(0, weight=1)
+        self.canvas = tk.Canvas(cards_outer, highlightthickness=0, background="#f3f6fa")
+        self.canvas.grid(row=0, column=0, sticky="nsew")
+        scroll = ttk.Scrollbar(cards_outer, orient="vertical", command=self.canvas.yview)
+        scroll.grid(row=0, column=1, sticky="ns")
+        horizontal_scroll = ttk.Scrollbar(cards_outer, orient="horizontal", command=self.canvas.xview)
+        horizontal_scroll.grid(row=1, column=0, sticky="ew")
+        self.canvas.configure(yscrollcommand=scroll.set, xscrollcommand=horizontal_scroll.set)
+        self.cards_frame = ttk.Frame(self.canvas)
+        self.canvas_window = self.canvas.create_window((0, 0), window=self.cards_frame, anchor="nw")
+        self.cards_frame.bind("<Configure>", self._update_scroll)
+        self.canvas.bind("<Configure>", self._resize_cards)
+
         manual_header = ttk.Frame(manual_box)
         manual_header.pack(fill="x")
         ttk.Label(
@@ -549,86 +920,12 @@ class MRDPDFMerger:
             )
         )
 
-        # Left lower section: cleanup candidates from successful merges only.
-        cleanup_box = ttk.LabelFrame(left_panel, text="Original PDFs ready for cleanup", padding=7)
-        cleanup_box.pack(fill="both", expand=True)
-        ttk.Label(
-            cleanup_box,
-            text="Only PDFs used in successfully created merged files appear here.",
-            foreground="#555", wraplength=480
-        ).pack(anchor="w")
-        cleanup_tools = ttk.Frame(cleanup_box)
-        cleanup_tools.pack(fill="x", pady=(5, 2))
-        ttk.Button(cleanup_tools, text="Select all", command=lambda: self.set_cleanup_checks(True)).pack(side="left")
-        ttk.Button(cleanup_tools, text="Select none", command=lambda: self.set_cleanup_checks(False)).pack(side="left", padx=5)
-        self.cleanup_selected_var = tk.StringVar(value="0 selected")
-        ttk.Label(cleanup_tools, textvariable=self.cleanup_selected_var).pack(side="right")
-
-        cleanup_list_wrap = ttk.Frame(cleanup_box)
-        cleanup_list_wrap.pack(fill="both", expand=True)
-        self.cleanup_canvas = tk.Canvas(
-            cleanup_list_wrap, highlightthickness=0, height=150, background="#f3f6fa"
+        self.root.after(
+            350,
+            lambda: right_sections.sashpos(
+                0, int(right_sections.winfo_height() * 0.7)
+            )
         )
-        cleanup_scroll = ttk.Scrollbar(cleanup_list_wrap, orient="vertical", command=self.cleanup_canvas.yview)
-        self.cleanup_canvas.configure(yscrollcommand=cleanup_scroll.set)
-        self.cleanup_canvas.pack(side="left", fill="both", expand=True)
-        cleanup_scroll.pack(side="right", fill="y")
-        self.cleanup_rows_frame = ttk.Frame(self.cleanup_canvas)
-        self.cleanup_canvas_window = self.cleanup_canvas.create_window(
-            (0, 0), window=self.cleanup_rows_frame, anchor="nw"
-        )
-        self.cleanup_rows_frame.bind(
-            "<Configure>",
-            lambda _e: self.cleanup_canvas.configure(scrollregion=self.cleanup_canvas.bbox("all"))
-        )
-        self.cleanup_canvas.bind(
-            "<Configure>",
-            lambda e: self.cleanup_canvas.itemconfigure(self.cleanup_canvas_window, width=e.width)
-        )
-        self.cleanup_empty_var = tk.StringVar(value="No cleanup candidates yet. Merge PDFs first.")
-        self.cleanup_empty_label = ttk.Label(cleanup_box, textvariable=self.cleanup_empty_var, foreground="#666")
-        self.cleanup_empty_label.pack(anchor="w", pady=(3, 5))
-        self.cleanup_button = ttk.Button(
-            cleanup_box, text="Move Selected to Recycle Bin",
-            style="Danger.TButton",
-            command=self.cleanup_selected_originals
-        )
-        self.cleanup_button.pack(fill="x", pady=(0, 4))
-        # Right side: scrollable patient cards (same matching and merge controls as before).
-        match_tools = ttk.Frame(right_panel)
-        match_tools.pack(fill="x", pady=(0, 5))
-        self.match_summary_var = tk.StringVar(value="0 source PDFs  |  0 confirmed groups  |  0 review groups  |  0 unmatched PDFs")
-        ttk.Label(
-            right_panel, textvariable=self.match_summary_var,
-            foreground="#5c6b7a", wraplength=720
-        ).pack(anchor="w", pady=(0, 5))
-        ttk.Label(match_tools, text="Patient search:").pack(side="left")
-        self.patient_search_var = tk.StringVar()
-        ttk.Entry(match_tools, textvariable=self.patient_search_var, width=28).pack(side="left", padx=(5, 10))
-        ttk.Label(match_tools, text="Show:").pack(side="left")
-        self.match_filter_var = tk.StringVar(value="All")
-        ttk.Combobox(
-            match_tools, textvariable=self.match_filter_var, state="readonly",
-            values=("All", "Confirmed Matches", "Review Required"),
-            width=18
-        ).pack(side="left", padx=5)
-        self.patient_search_var.trace_add("write", lambda *_args: self._apply_group_filters())
-        self.match_filter_var.trace_add("write", lambda *_args: self._apply_group_filters())
-        cards_outer = ttk.Frame(right_panel)
-        cards_outer.pack(fill="both", expand=True)
-        cards_outer.rowconfigure(0, weight=1)
-        cards_outer.columnconfigure(0, weight=1)
-        self.canvas = tk.Canvas(cards_outer, highlightthickness=0, background="#f3f6fa")
-        self.canvas.grid(row=0, column=0, sticky="nsew")
-        scroll = ttk.Scrollbar(cards_outer, orient="vertical", command=self.canvas.yview)
-        scroll.grid(row=0, column=1, sticky="ns")
-        horizontal_scroll = ttk.Scrollbar(cards_outer, orient="horizontal", command=self.canvas.xview)
-        horizontal_scroll.grid(row=1, column=0, sticky="ew")
-        self.canvas.configure(yscrollcommand=scroll.set, xscrollcommand=horizontal_scroll.set)
-        self.cards_frame = ttk.Frame(self.canvas)
-        self.canvas_window = self.canvas.create_window((0, 0), window=self.cards_frame, anchor="nw")
-        self.cards_frame.bind("<Configure>", self._update_scroll)
-        self.canvas.bind("<Configure>", self._resize_cards)
 
         self._install_wheel_scrolling()
 
@@ -750,10 +1047,6 @@ class MRDPDFMerger:
                 added += 1
 
         self.files.sort(key=lambda p: (p.parent.as_posix().lower(), p.name.lower()))
-        if self.files and self.output_dir is None:
-            # Retain a convenient starting folder for cross-folder destination dialogs.
-            self.output_dir = self.files[0].parent / "Merged_PDFs"
-            self.output_var.set(f"Mixed-folder browse start: {self.output_dir}")
         self.rebuild_groups()
         self.file_count_label.config(text=f"{len(self.files)} PDFs loaded ({added} newly added)")
         self._update_total_page_count()
@@ -763,15 +1056,6 @@ class MRDPDFMerger:
             status += f" {len(scan_errors)} path(s) could not be added."
             messagebox.showwarning("Some paths were not added", "\n".join(scan_errors[:10]))
         self.status_var.set(status)
-
-    def choose_output(self):
-        if self._merge_running:
-            messagebox.showwarning("Merge in progress", "Wait for merging to finish before changing the output folder.")
-            return
-        chosen = filedialog.askdirectory(title="Choose output folder")
-        if chosen:
-            self.output_dir = Path(chosen).resolve()
-            self.output_var.set(f"Mixed-folder browse start: {self.output_dir}")
 
     def clear_all(self):
         if self._merge_running:
@@ -794,8 +1078,9 @@ class MRDPDFMerger:
         self.cleanup_candidates.clear()
         self._generated_outputs.clear()
         self._row_settings.clear()
-        self.output_dir = None
-        self.output_var.set("Same-folder outputs; choose destination for mixed folders")
+        self.output_var.set(
+            f"Merged PDFs: {MERGED_OUTPUT_DIRECTORY} under each source folder"
+        )
         self.file_count_label.config(text="0 PDFs loaded")
         self.total_pages_var.set("0 pages")
         self.rebuild_groups()
@@ -1230,7 +1515,7 @@ class MRDPDFMerger:
             )
             empty_text = (
                 "No confirmed patient groups." if category == "confirmed"
-                else "No spelling-variation suggestions require review."
+                else "No potential matches require review."
             )
             empty_label = ttk.Label(
                 section, text=empty_text, foreground="#667789", padding=(8, 3)
@@ -1299,7 +1584,7 @@ class MRDPDFMerger:
                     self._section_empty_labels[category].pack(anchor="w")
                     default_text = (
                         "No confirmed patient groups." if category == "confirmed"
-                        else "No spelling-variation suggestions require review."
+                        else "No potential matches require review."
                     )
                     self._section_empty_labels[category].configure(
                         text=f"No results for “{query}”." if query else default_text
@@ -1792,6 +2077,8 @@ class MRDPDFMerger:
             "Create separate merged PDFs for these groups?\n\n"
             + "\n".join(descriptions)
             + "\n\nOnly checked PDFs will be included, in the displayed order and page ranges."
+            + f"\nEach merged PDF will be saved in a {MERGED_OUTPUT_DIRECTORY} "
+            "subfolder inside every source folder in its group."
         )
         title = "Confirm all groups" if all_groups else "Confirm group merge"
         if not confirmed and not messagebox.askyesno(title, prompt):
@@ -1799,17 +2086,8 @@ class MRDPDFMerger:
 
         resolved_jobs = []
         for kind, group, label, selection in jobs:
-            destination = source_folder_for_paths(group["files"])
-            if destination is None:
-                options = {"title": f"Choose output folder for {label}"}
-                if self.output_dir and self.output_dir.is_dir():
-                    options["initialdir"] = str(self.output_dir)
-                chosen = filedialog.askdirectory(**options)
-                if not chosen:
-                    self.status_var.set("Merge cancelled; no destination was selected.")
-                    return
-                destination = Path(chosen).resolve()
-            resolved_jobs.append((kind, group, label, selection, destination))
+            destinations = merged_output_directories(group["files"])
+            resolved_jobs.append((kind, group, label, selection, destinations))
 
         self._merge_running = True
         self.merge_all_button.config(state="disabled")
@@ -1829,7 +2107,7 @@ class MRDPDFMerger:
         failures = list(validation_failures)
         failed_groups = []
         total_jobs = len(jobs)
-        for index, (kind, group, label, selected, output_dir) in enumerate(jobs, start=1):
+        for index, (kind, group, label, selected, output_dirs) in enumerate(jobs, start=1):
             self._merge_queue.put(("start", index, total_jobs, label))
             try:
                 def report_page_progress(completed, total):
@@ -1837,10 +2115,10 @@ class MRDPDFMerger:
                         ("page_progress", index, total_jobs, label, completed, total)
                     )
 
-                output, sources = merge_pdf_selection(
-                    selected, output_dir, label, progress_callback=report_page_progress
+                outputs, sources = merge_pdf_selection_to_folders(
+                    selected, output_dirs, label, progress_callback=report_page_progress
                 )
-                successes.append((output, sources, label, kind, group))
+                successes.append((outputs, sources, label, kind, group))
             except Exception as exc:
                 failures.append(f"{label}: {exc}")
                 failed_groups.append((kind, group))
@@ -1870,8 +2148,9 @@ class MRDPDFMerger:
                     self.cleanup_candidates = accumulate_cleanup_candidates(
                         self.cleanup_candidates, successes
                     )
-                    for output, _sources, _label, kind, group in successes:
-                        self._generated_outputs.add(self._path_key(output))
+                    for outputs, _sources, _label, kind, group in successes:
+                        for output in outputs:
+                            self._generated_outputs.add(self._path_key(output))
                         widgets = self.group_widgets if kind == "automatic" else self.manual_group_widgets
                         group_ui = next((entry for entry in widgets if entry["group"] is group), None)
                         if group_ui is not None:
@@ -1886,11 +2165,17 @@ class MRDPDFMerger:
                     self.merge_all_button.config(state="normal")
                     self.merge_progress["value"] = 100 if successes else 0
                     message = (
-                        f"Successfully created {len(successes)} merged PDF(s).\n"
+                        f"Successfully created "
+                        f"{sum(len(outputs) for outputs, *_rest in successes)} merged PDF(s) "
+                        f"for {len(successes)} group(s).\n"
                         f"Failed groups: {len(failures)}."
                     )
                     if successes:
-                        output_folders = sorted({str(output.parent) for output, *_rest in successes})
+                        output_folders = sorted({
+                            str(output.parent)
+                            for outputs, *_rest in successes
+                            for output in outputs
+                        })
                         message += "\n\nOutput folder(s):\n" + "\n".join(output_folders)
                     if failures:
                         message += "\n\nNot merged:\n" + "\n".join(failures[:12])
@@ -1900,7 +2185,8 @@ class MRDPDFMerger:
                             "in the cleanup panel."
                         )
                     self.status_var.set(
-                        f"Created {len(successes)} merged PDF(s); {len(failures)} failed."
+                        f"Created {sum(len(outputs) for outputs, *_rest in successes)} "
+                        f"merged PDF(s); {len(failures)} failed."
                     )
                     messagebox.showinfo("Merge finished", message)
                     return

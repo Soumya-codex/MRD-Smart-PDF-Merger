@@ -9,11 +9,15 @@ from pypdf import PdfReader, PdfWriter
 import mrd_pdf_merger as merger_module
 from mrd_pdf_merger import (
     MRDPDFMerger,
+    MatchingConfig,
     accumulate_cleanup_candidates,
     assign_source_to_group,
     cleanup_paths_from_successes,
+    extract_filename_identity,
     get_name_tokens,
     is_generated_output,
+    merge_pdf_selection_to_folders,
+    merged_output_directories,
     make_groups,
     merge_pdf_selection,
     move_cleanup_sources_to_trash,
@@ -74,6 +78,19 @@ class FilenameMatchingTests(unittest.TestCase):
         self.assertEqual(groups[0]["category"], "confirmed")
         self.assertEqual(groups[0]["level"], "Exact Match")
 
+    def test_lopinti_scanner_and_attached_cover_names_normalize_to_same_patient(self):
+        names = [
+            "LOPINTI  SAHADEVA  S-6 202610170037326.pdf",
+            "LOPINTI SAHADEVACOVER.pdf",
+        ]
+        self.assertEqual(get_name_tokens(names[0]), ["LOPINTI", "SAHADEVA"])
+        self.assertEqual(get_name_tokens(names[1]), ["LOPINTI", "SAHADEVA"])
+        groups = make_groups([Path(name) for name in names])
+        self.assertEqual(len(groups), 1)
+        self.assertEqual(groups[0]["category"], "confirmed")
+        self.assertEqual(groups[0]["key"], ("LOPINTI", "SAHADEVA"))
+        self.assertEqual({path.name for path in groups[0]["files"]}, set(names))
+
     def test_ratnakar_biswal_examples_share_one_group(self):
         self.assert_patient_files_grouped(
             [
@@ -83,6 +100,102 @@ class FilenameMatchingTests(unittest.TestCase):
             ],
             "RATNAKAR BISWAL",
         )
+
+    def test_bidyadhara_bhoi_ct_report_and_ncct_files_share_one_group(self):
+        names = [
+            "BIDYADHARA BHOI CT REPORT.pdf",
+            "BIDYADHARA BHOI NCCT.pdf",
+            "BIDYADHARA BHOI S5 2026101910048850.pdf",
+        ]
+        for name in names:
+            self.assertEqual(get_name_tokens(name), ["BIDYADHARA", "BHOI"])
+        self.assert_patient_files_grouped(names, "BIDYADHARA BHOI")
+
+    def test_scanner_suffix_and_all_requested_document_labels_are_removed(self):
+        names = [
+            "ABHIMANYU SUTARA.pdf",
+            "ABHIMANYU SUTARA S.pdf",
+            "ABHIMANYU SUTARA COVER.pdf",
+            "ABHIMANYU SUTARA MRI.pdf",
+            "ABHIMANYU SUTARA USG.pdf",
+            "ABHIMANYU SUTARA X-RAY REPORT.pdf",
+            "ABHIMANYU SUTARA DISCHARGE SUMMARY.pdf",
+        ]
+        self.assert_patient_files_grouped(names, "ABHIMANYU SUTARA")
+
+    def test_patient_identifiers_are_removed_and_retained_as_supporting_metadata(self):
+        identity = extract_filename_identity(
+            "BIDYADHARA BHOI UHID001 EP-234 VISIT-56 MOBILE 9876543210 20261019.pdf"
+        )
+        self.assertEqual(identity.tokens, ("BIDYADHARA", "BHOI"))
+        self.assertEqual(identity.identifiers["UHID"], frozenset({"001"}))
+        self.assertEqual(identity.identifiers["EP"], frozenset({"234"}))
+        self.assertEqual(identity.identifiers["VISIT"], frozenset({"56"}))
+        self.assertEqual(identity.identifiers["MOBILE"], frozenset({"9876543210"}))
+        self.assertEqual(identity.identifiers["DATE"], frozenset({"20261019"}))
+
+    def test_first_middle_agreement_is_review_only_when_surnames_differ(self):
+        groups = make_groups([
+            Path("RAMESH KUMAR SAHU.pdf"),
+            Path("RAMESH KUMAR DAS.pdf"),
+        ])
+        self.assertEqual(len(groups), 1)
+        self.assertEqual(groups[0]["category"], "review")
+        self.assertIn("First/middle", groups[0]["level"])
+
+    def test_conflicting_uhids_are_not_grouped_even_for_identical_names(self):
+        files = [
+            Path("BIDYADHARA BHOI UHID001.pdf"),
+            Path("BIDYADHARA BHOI UHID002.pdf"),
+        ]
+        self.assertEqual(make_groups(files), [])
+        self.assertEqual(set(unmatched_source_paths(files, [])), set(files))
+
+    def test_alphanumeric_uhid_values_are_compared_in_full(self):
+        files = [
+            Path("BIDYADHARA BHOI UHID-A001.pdf"),
+            Path("BIDYADHARA BHOI UHID-B001.pdf"),
+        ]
+        self.assertEqual(make_groups(files), [])
+
+    def test_unidentified_file_does_not_bridge_conflicting_uhid_groups(self):
+        files = [
+            Path("BIDYADHARA BHOI.pdf"),
+            Path("BIDYADHARA BHOI UHID001.pdf"),
+            Path("BIDYADHARA BHOI UHID002.pdf"),
+        ]
+        groups = make_groups(files)
+        self.assertEqual(groups, [])
+        self.assertEqual(set(unmatched_source_paths(files, groups)), set(files))
+
+    def test_shared_uhid_supports_a_review_match_but_does_not_auto_confirm_typo(self):
+        groups = make_groups([
+            Path("ABHIMANYU SUTARA UHID001.pdf"),
+            Path("ABHIMANYU SUTARR UHID001.pdf"),
+        ])
+        self.assertEqual(len(groups), 1)
+        self.assertEqual(groups[0]["category"], "review")
+
+    def test_supporting_identifiers_can_resolve_a_borderline_name_candidate(self):
+        files = [
+            Path("ABHIMANYU SUTARA EP1234.pdf"),
+            Path("ABHIMANYU SUTARR EP1234.pdf"),
+        ]
+        config = MatchingConfig(
+            token_similarity_threshold=1.0,
+            fuzzy_token_threshold=1.0,
+            minimum_fuzzy_name_similarity=1.0,
+        )
+        groups = make_groups(files, config)
+        self.assertEqual(len(groups), 1)
+        self.assertEqual(groups[0]["category"], "review")
+        self.assertIn("supporting identifier", groups[0]["level"])
+
+    def test_matching_thresholds_are_configurable(self):
+        files = [Path("NAZIA KHARAM.pdf"), Path("NAZIA KHANAM.pdf")]
+        self.assertEqual(len(make_groups(files)), 1)
+        strict_config = MatchingConfig(fuzzy_token_threshold=1.0)
+        self.assertEqual(make_groups(files, strict_config), [])
 
     def test_minor_spelling_difference_is_a_reviewable_possible_match(self):
         groups = make_groups([
@@ -94,17 +207,27 @@ class FilenameMatchingTests(unittest.TestCase):
         self.assertIn("Review Required", groups[0]["level"])
         self.assertEqual(len(groups[0]["files"]), 2)
 
-    def test_different_complete_names_do_not_match_on_first_name_alone(self):
+    def test_same_first_and_middle_names_with_different_surnames_require_review(self):
         files = [
             Path("ANANTA KUMAR DAS COVER.pdf"),
             Path("ANANTA KUMAR ROUT COVER.pdf"),
         ]
         groups = make_groups(files)
-        self.assertEqual(groups, [])
-        self.assertEqual(
-            {path.name for path in unmatched_source_paths(files, groups)},
-            {"ANANTA KUMAR DAS COVER.pdf", "ANANTA KUMAR ROUT COVER.pdf"},
-        )
+        self.assertEqual(len(groups), 1)
+        self.assertEqual(groups[0]["category"], "review")
+
+    def test_exact_and_review_candidates_are_emitted_without_duplicate_files(self):
+        files = [
+            Path("RAMESH KUMAR SAHU.pdf"),
+            Path("RAMESH KUMAR SAHU REPORT.pdf"),
+            Path("RAMESH KUMAR DAS.pdf"),
+        ]
+        groups = make_groups(files)
+        self.assertEqual(len(groups), 1)
+        self.assertEqual(groups[0]["category"], "review")
+        grouped_paths = [path for group in groups for path in group["files"]]
+        self.assertEqual(len(grouped_paths), len(set(grouped_paths)))
+        self.assertEqual(set(grouped_paths), set(files))
 
     def test_single_pdf_is_unmatched_not_review_required(self):
         source = Path("SINGLE PATIENT COVER.pdf")
@@ -148,6 +271,86 @@ class FilenameMatchingTests(unittest.TestCase):
 
 
 class ApplicationWorkflowTests(unittest.TestCase):
+    def test_discovered_pdfs_are_rendered_or_remain_unmatched_in_explorer(self):
+        root = tk.Tk()
+        root.withdraw()
+        app = MRDPDFMerger(root)
+        try:
+            with tempfile.TemporaryDirectory() as temp:
+                source_dir = Path(temp)
+                nested_dir = source_dir / "nested"
+                nested_dir.mkdir()
+                sources = [
+                    source_dir / "LOPINTI  SAHADEVA  S-6 202610170037326.pdf",
+                    source_dir / "LOPINTI SAHADEVACOVER.pdf",
+                    source_dir / "NAZIA KHARAM COVER.pdf",
+                    source_dir / "NAZIA KHANAM S5 2026101410053501.pdf",
+                    nested_dir / "UNRELATED SYNTHETIC PERSON.pdf",
+                ]
+                for source in sources:
+                    writer = PdfWriter()
+                    writer.add_blank_page(width=100, height=100)
+                    with source.open("wb") as stream:
+                        writer.write(stream)
+
+                app._add_paths([source_dir])
+
+                self.assertEqual(len(app.files), len(sources))
+                self.assertEqual(
+                    {group["category"] for group in app.groups},
+                    {"confirmed", "review"},
+                )
+                self.assertTrue(any(
+                    group["category"] == "confirmed"
+                    and group["key"] == ("LOPINTI", "SAHADEVA")
+                    and len(group["files"]) == 2
+                    for group in app.groups
+                ))
+                self.assertTrue(any(
+                    group["category"] == "review"
+                    and {path.name for path in group["files"]}
+                    == {"NAZIA KHARAM COVER.pdf", "NAZIA KHANAM S5 2026101410053501.pdf"}
+                    for group in app.groups
+                ))
+                self.assertEqual(
+                    [path.name for path in unmatched_source_paths(app.files, app.groups)],
+                    ["UNRELATED SYNTHETIC PERSON.pdf"],
+                )
+                self.assertEqual(
+                    {widget["group"]["category"] for widget in app.group_widgets},
+                    {"confirmed", "review"},
+                )
+                self.assertEqual(
+                    {app._path_key(path) for path in app._tree_file_paths.values()},
+                    {app._path_key(path) for path in sources},
+                )
+
+                state_counts = {}
+                for group in app.groups:
+                    for path in group["files"]:
+                        key = app._path_key(path)
+                        state_counts[key] = state_counts.get(key, 0) + 1
+                for path in unmatched_source_paths(app.files, app.groups):
+                    key = app._path_key(path)
+                    state_counts[key] = state_counts.get(key, 0) + 1
+                self.assertEqual(
+                    state_counts,
+                    {app._path_key(path): 1 for path in sources},
+                )
+
+                deadline = time.time() + 5
+                while app._page_tasks and time.time() < deadline:
+                    root.update()
+                    time.sleep(0.01)
+                self.assertFalse(app._page_tasks)
+                # Let the initial layout callbacks run before destroying the Tk root.
+                deadline = time.time() + 0.4
+                while time.time() < deadline:
+                    root.update()
+                    time.sleep(0.01)
+        finally:
+            root.destroy()
+
     def test_unmatched_files_stay_in_explorer_and_merge_all_includes_review_groups(self):
         root = tk.Tk()
         root.withdraw()
@@ -215,7 +418,7 @@ class ApplicationWorkflowTests(unittest.TestCase):
                 self.assertIn("Eligible groups: 2", summary_prompts[0])
                 self.assertIn("Selected PDFs: 3", summary_prompts[0])
                 self.assertIn("Selected review-required groups: 1", summary_prompts[0])
-                outputs = list(source_dir.glob("*_MERGED*.pdf"))
+                outputs = list(source_dir.rglob("*_MERGED*.pdf"))
                 self.assertEqual(len(outputs), 2)
                 self.assertEqual(len(app.cleanup_candidates), 3)
                 self.assertTrue(all(source.exists() for source in sources))
@@ -326,6 +529,50 @@ class MergeEngineTests(unittest.TestCase):
         self.assertEqual(destination, source_folder.resolve())
         self.assertEqual(output.parent.resolve(), source_folder.resolve())
         self.assertEqual(included, [source])
+
+    def test_group_outputs_are_created_in_each_source_folder(self):
+        source_folders = [
+            self.root / "first",
+            self.root / "nested" / "second",
+        ]
+        selection = []
+        for index, folder in enumerate(source_folders, start=1):
+            folder.mkdir(parents=True)
+            source = folder / f"Source_{index}.pdf"
+            writer = PdfWriter()
+            writer.add_blank_page(width=100, height=100)
+            with source.open("wb") as stream:
+                writer.write(stream)
+            selection.append((source, 1, 1))
+
+        output_dirs = merged_output_directories([source for source, *_ in selection])
+        outputs, included = merge_pdf_selection_to_folders(
+            selection, output_dirs, "Patient"
+        )
+
+        self.assertEqual(
+            {output.parent.resolve() for output in outputs},
+            {(folder / "Merged_PDFs").resolve() for folder in source_folders},
+        )
+        self.assertEqual(len(outputs), 2)
+        self.assertEqual(included, [source for source, *_ in selection])
+        self.assertTrue(all(len(PdfReader(str(output)).pages) == 2 for output in outputs))
+
+    def test_multi_folder_output_failure_removes_partial_outputs(self):
+        source = self.make_pdf("Source.pdf", [100])
+        blocked_parent = self.root / "not-a-folder"
+        blocked_parent.write_text("block directory creation", encoding="utf-8")
+        output_dirs = [
+            self.root / "first" / "Merged_PDFs",
+            blocked_parent / "Merged_PDFs",
+        ]
+
+        with self.assertRaises(OSError):
+            merge_pdf_selection_to_folders(
+                [(source, 1, 1)], output_dirs, "Patient"
+            )
+
+        self.assertFalse((output_dirs[0] / "Patient_MERGED.pdf").exists())
 
     def test_cross_folder_group_requires_an_explicit_destination(self):
         first = self.make_pdf("First.pdf", [100])

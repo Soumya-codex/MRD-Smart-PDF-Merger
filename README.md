@@ -43,12 +43,17 @@ The right panel has exactly two matching sections, plus a compact source/group
 summary, patient-name search, category filters, and collapsible cards:
 
 - **CONFIRMED MATCHES**: files with the same complete normalized patient name.
-  Scanner suffixes/IDs (for example `S-5`, `S 6`, or `SCAN 5`), document labels,
-  dates, timestamps, numeric IDs, punctuation, and extra whitespace are
-  normalized away.
-- **REVIEW REQUIRED**: conservative spelling-variation suggestions. They are
-  never auto-confirmed; review the files before merging. Distinct surnames are
-  not joined just because first or middle names match.
+  Scanner suffixes/IDs (for example `S-5`, `S 6`, or `SCAN 5`), document labels
+  such as CT, NCCT, MRI, USG, X-RAY, REPORT, COVER, and DISCHARGE SUMMARY,
+  UHID/EP/visit/mobile/date identifiers, punctuation, and extra whitespace are
+  normalized away while identifier values are retained as matching evidence.
+- **REVIEW REQUIRED**: potential matches from first-and-middle-name agreement,
+  token similarity, spelling similarity, or supporting identifiers. These are
+  never auto-confirmed; different surnames and conflicting UHIDs cannot become
+  confirmed matches. Files with conflicting UHIDs are never grouped together,
+  and an unnumbered filename is not used to bridge those identities.
+- Matching thresholds are defined by `MatchingConfig` in `mrd_pdf_merger.py`
+  and can be overridden when calling `make_groups`.
 
 PDFs without an exact or reviewable match have no automatic card. They remain
 visible and selectable in the left folder explorer, and are included in the
@@ -77,17 +82,16 @@ background worker with progress and a completion/failure summary.
 
 ### Output destinations
 
-- When all selected source PDFs in a group are in the same folder, that exact
-  folder is used for the group's output.
-- When a group contains PDFs from multiple folders, the application asks you
-  to choose that group's output folder before merging. For **Merge All**, all
-  required destination choices are collected before the merge starts; cancelling
-  a destination dialog cancels the batch.
-- The **Output Folder** setting is retained as the starting location for
-  mixed-folder destination dialogs. Same-folder groups always use their source
-  folder.
+- Merged PDFs are saved in a `Merged_PDFs` subfolder inside each source folder
+  represented in the group. The subfolder is created automatically when needed.
+- If a group contains source PDFs from multiple folders, an identical merged
+  output is created in each of those folders. No output destination needs to be
+  selected.
 - Existing outputs are never overwritten; a unique `_MERGED` filename is
   selected. Generated merged PDFs are excluded from later scans.
+
+The **Add Folder** button opens a folder picker to choose input PDFs; it does
+not select an output destination.
 
 ## Cleanup safety
 
