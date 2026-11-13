@@ -1,10 +1,13 @@
 import re
 import os
+import json
 import queue
+import sys
 import tempfile
 import threading
 import uuid
 import tkinter as tk
+import datetime
 from difflib import SequenceMatcher
 from tkinter import ttk, filedialog, messagebox
 from pathlib import Path
@@ -28,6 +31,11 @@ try:
     from send2trash import send2trash
 except ImportError:
     send2trash = None
+
+
+def resource_path(relative_path):
+    base_path = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base_path, relative_path)
 
 
 # Words commonly found in filenames that describe documents, not patient identity.
@@ -2195,11 +2203,49 @@ class MRDPDFMerger:
         if self._merge_running:
             self.root.after(100, self._poll_merge_queue)
 
+def check_trial(program_data=None, today=None):
+    program_data = program_data or r"C:\ProgramData"
+    today = today or datetime.date.today()
+    license_dir = os.path.join(program_data, "MRD_Smart_PDF_Merger")
+    license_file = os.path.join(license_dir, "license.json")
+    try:
+        if not os.path.isdir(license_dir):
+            os.makedirs(license_dir)
+            initial_date = today.isoformat()
+            with open(license_file, "w", encoding="utf-8") as file:
+                json.dump(
+                    {"install_date": initial_date, "last_run_date": initial_date}, file
+                )
+        with open(license_file, "r", encoding="utf-8") as file:
+            license_data = json.load(file)
+        install_date = datetime.date.fromisoformat(license_data["install_date"])
+        last_run_date = datetime.date.fromisoformat(license_data["last_run_date"])
+        if today < last_run_date or today < install_date:
+            raise ValueError("The system date was rolled back.")
+        license_data["last_run_date"] = today.isoformat()
+        with open(license_file, "w", encoding="utf-8") as file:
+            json.dump(license_data, file)
+    except (OSError, ValueError, KeyError, TypeError):
+        messagebox.showerror("License Error", "The trial license is missing or invalid.")
+        sys.exit(1)
+    if (today - install_date).days >= 60:
+        messagebox.showerror(
+            "Trial Expired",
+            "Your 2-month trial period has expired.\n\n"
+            "Please contact the Administrator for activation.\n\n"
+            "Administrator: Rinkun\nMobile: 9348448730",
+        )
+        sys.exit(0)
+    return 60 - (today - install_date).days
+
+
 def main():
+    check_trial()
     if DND_AVAILABLE:
         root = TkinterDnD.Tk()
     else:
         root = tk.Tk()
+    root.iconbitmap(resource_path("app_icon.ico"))
     app = MRDPDFMerger(root)
     root.mainloop()
 

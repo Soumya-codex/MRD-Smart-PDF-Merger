@@ -106,6 +106,26 @@ shows the selected-file count, requires explicit confirmation, and uses
 removed from the list; failures remain listed with their error. There is no
 permanent-delete action.
 
+## Trial licensing and Windows packaging
+
+The application starts a 60-day trial on its first launch and stores the
+installation date and last-run date in
+`C:\ProgramData\MRD_Smart_PDF_Merger\license.json`. If the existing license
+folder is present but its file is missing or invalid, startup stops instead of
+creating a replacement trial. This local check is not tamper-proof.
+
+To package the application from the project directory after installing
+PyInstaller:
+
+```bat
+pyinstaller --noconfirm --clean --onefile --windowed --name "MRD Smart PDF Merger" --icon="app_icon.ico" --add-data "app_icon.ico;." --collect-all tkinterdnd2 mrd_pdf_merger.py
+```
+
+The icon option sets the EXE's File Explorer icon, and `--add-data` makes the
+same ICO available to the Tk window at runtime. The license path is based on
+Windows `ProgramData`, not the current directory or the PyInstaller extraction
+directory.
+
 ## Tests
 
 Run the synthetic-PDF unit suite from the project directory:
@@ -117,4 +137,7 @@ py -m unittest -v
 The tests cover normalization and grouping, conservative fuzzy suggestions,
 unmatched-source availability, checkbox/page selection helpers, manual
 assignment, same- and cross-folder destinations, output-name collisions, PDF
-validation, and cleanup-history safety.
+validation, cleanup-history safety, and trial initialization, expiry, invalid
+files, and date rollback. Trial dates and storage paths are injected in tests,
+so trial boundaries can be verified without waiting 60 days or changing the
+machine clock.

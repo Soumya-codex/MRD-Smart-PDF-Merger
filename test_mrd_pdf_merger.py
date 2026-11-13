@@ -2,7 +2,9 @@ import tempfile
 import time
 import tkinter as tk
 import unittest
+from datetime import date, timedelta
 from pathlib import Path
+from unittest.mock import patch
 
 from pypdf import PdfReader, PdfWriter
 
@@ -268,6 +270,74 @@ class FilenameMatchingTests(unittest.TestCase):
             Path("UNRELATED TWO REPORT.pdf"),
         ])
         self.assertEqual(groups, [])
+
+
+class TrialCheckTests(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.program_data = Path(self.temp_dir.name)
+        self.today = date(2026, 1, 1)
+        self.license_dir = self.program_data / "MRD_Smart_PDF_Merger"
+        self.license_file = self.license_dir / "license.json"
+
+    def tearDown(self):
+        self.temp_dir.cleanup()
+
+    def test_first_launch_records_date_and_restart_keeps_trial_date(self):
+        self.assertEqual(
+            merger_module.check_trial(program_data=str(self.program_data), today=self.today),
+            60,
+        )
+        self.assertEqual(
+            merger_module.check_trial(
+                program_data=str(self.program_data), today=self.today + timedelta(days=10)
+            ),
+            50,
+        )
+
+    def test_expired_trial_displays_popup_and_exits(self):
+        merger_module.check_trial(program_data=str(self.program_data), today=self.today)
+
+        with patch.object(merger_module.messagebox, "showerror") as popup:
+            with self.assertRaises(SystemExit) as exit_error:
+                merger_module.check_trial(
+                    program_data=str(self.program_data), today=self.today + timedelta(days=60)
+                )
+
+        self.assertEqual(exit_error.exception.code, 0)
+        self.assertEqual(popup.call_args.args[0], "Trial Expired")
+        self.assertIn("Your 2-month trial period has expired.", popup.call_args.args[1])
+        self.assertIn("9348448730", popup.call_args.args[1])
+
+    def test_missing_or_corrupted_license_does_not_start_a_new_trial(self):
+        merger_module.check_trial(program_data=str(self.program_data), today=self.today)
+        self.license_file.unlink()
+        with patch.object(merger_module.messagebox, "showerror"):
+            with self.assertRaises(SystemExit):
+                merger_module.check_trial(
+                    program_data=str(self.program_data), today=self.today + timedelta(days=5)
+                )
+        self.assertFalse(self.license_file.exists())
+
+        self.license_file.write_text("{", encoding="utf-8")
+        with patch.object(merger_module.messagebox, "showerror"):
+            with self.assertRaises(SystemExit):
+                merger_module.check_trial(
+                    program_data=str(self.program_data), today=self.today + timedelta(days=5)
+                )
+        self.assertEqual(self.license_file.read_text(encoding="utf-8"), "{")
+
+    def test_system_date_rollback_is_rejected(self):
+        merger_module.check_trial(program_data=str(self.program_data), today=self.today)
+        merger_module.check_trial(
+            program_data=str(self.program_data), today=self.today + timedelta(days=10)
+        )
+
+        with patch.object(merger_module.messagebox, "showerror"):
+            with self.assertRaises(SystemExit):
+                merger_module.check_trial(
+                    program_data=str(self.program_data), today=self.today + timedelta(days=9)
+                )
 
 
 class ApplicationWorkflowTests(unittest.TestCase):
